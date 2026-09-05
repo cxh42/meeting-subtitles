@@ -14,7 +14,7 @@ from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
 
-from meeting_subtitles.client import Line, Snapshot
+from meeting_subtitles.model import Line, Snapshot
 
 logger = logging.getLogger(__name__)
 

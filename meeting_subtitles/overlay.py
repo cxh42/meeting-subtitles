@@ -15,8 +15,8 @@ import tkinter as tk
 import tkinter.font as tkfont
 from collections.abc import Callable
 
-from meeting_subtitles.client import Snapshot
 from meeting_subtitles.gnome import screen_scale
+from meeting_subtitles.model import Snapshot
 from meeting_subtitles.rounded import RoundedWindow, undecorate
 
 logger = logging.getLogger(__name__)

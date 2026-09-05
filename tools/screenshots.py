@@ -101,7 +101,7 @@ def pump(window, seconds: float) -> None:
 
 
 def shoot_overlay(out: Path) -> None:
-    from meeting_subtitles.client import Line, Snapshot
+    from meeting_subtitles.model import Line, Snapshot
     from meeting_subtitles.overlay import SubtitleOverlay
 
     overlay = SubtitleOverlay(on_close=lambda: None, font_size=17,

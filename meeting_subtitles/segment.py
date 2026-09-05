@@ -17,7 +17,7 @@ whole line's span -- makes the transcript useless for seeking.
 import re
 
 from meeting_subtitles.cleanup import strip_non_speech
-from meeting_subtitles.client import Line, Snapshot
+from meeting_subtitles.model import Line, Snapshot
 
 #: Split after . ! ? … and their full-width forms, when followed by a space or
 #: end of text. The lookbehind keeps the punctuation with the sentence it ends.
