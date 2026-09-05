@@ -193,7 +193,7 @@ Terminal=false
 Categories=AudioVideo;Audio;
 Keywords=subtitle;transcription;meeting;zoom;字幕;转录;会议;
 StartupNotify=true
-StartupWMClass=Tk
+StartupWMClass=Meeting-subtitles
 EOF
     chmod +x "$DESKTOP"
     update-desktop-database "$APPS" 2>/dev/null || true

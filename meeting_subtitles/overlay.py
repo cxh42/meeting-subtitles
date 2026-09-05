@@ -99,7 +99,11 @@ class SubtitleOverlay:
         self._pending = 0
         self.history: list = []
 
-        self.root = tk.Tk()
+        # className sets the window's WM_CLASS, which is how the desktop
+        # associates a running window with its .desktop entry -- for the icon
+        # in the dash, and for grouping. Tk's default is the bare "Tk", which
+        # every other Tk program on the system also claims.
+        self.root = tk.Tk(className="meeting-subtitles")
         self.root.title("Meeting Subtitles")
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
