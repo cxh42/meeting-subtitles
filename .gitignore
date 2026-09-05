@@ -1,0 +1,21 @@
+# Virtualenv created by install.sh
+.venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Recorded meetings never belong in the repository
+Meetings/
+*.wav
+transcript.md
+transcript.srt
+transcript.json
+
+# Editors
+.vscode/
+.idea/
+*.swp

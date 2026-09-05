@@ -1,0 +1,27 @@
+meeting-subtitles
+Copyright 2026 cxh42
+
+Licensed under the Apache License, Version 2.0 (the "License"); see LICENSE.
+
+This product depends on, and is designed to run against, WhisperLiveKit:
+
+    WhisperLiveKit
+    Copyright 2025 Quentin Fuxa
+    Apache License 2.0
+    https://github.com/QuentinFuxa/WhisperLiveKit
+
+WhisperLiveKit provides the real-time transcription server that this project
+drives. No WhisperLiveKit source is copied into this repository; it is
+installed as a dependency. WhisperLiveKit in turn builds on SimulStreaming
+(ÚFAL), whisper_streaming (ÚFAL), silero-vad (snakers4) and NeMo (NVIDIA) --
+see its own LICENSE for the full list.
+
+The models this project downloads at runtime carry their own licenses:
+
+    Whisper large-v3          OpenAI              MIT
+    faster-whisper large-v3   Systran / CTranslate2   MIT
+    NLLB-200-distilled-1.3B   Meta                CC-BY-NC-4.0
+    Qwen3-4B-Instruct-2507    Alibaba             Apache-2.0
+
+Note that NLLB-200 is licensed CC-BY-NC-4.0, which permits non-commercial use
+only. Choose a different translation backend if you need commercial use.

@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # The text pipeline is the part that needs no GPU, no audio device and
+      # no model download, so it is the part CI can meaningfully run. The
+      # capture and inference paths are covered by
+      # `meeting-subtitles-doctor` on a real machine instead.
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest ruff
+
+      - name: Lint
+        run: ruff check meeting_subtitles tools tests
+
+      - name: Test
+        run: python -m pytest tests -q
+        env:
+          PYTHONPATH: .

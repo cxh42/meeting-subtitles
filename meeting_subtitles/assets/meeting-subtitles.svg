@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <!-- Yaru / GNOME 45+ app icons are a rounded square with a soft top-lit
+         gradient, a one-pixel lit edge and real drop shadows. Flat shapes on a
+         flat fill are what make a hand-drawn icon look unfinished. -->
+    <linearGradient id="base" x1="64" y1="8" x2="64" y2="120" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#4e5567"/>
+      <stop offset="0.55" stop-color="#353b4b"/>
+      <stop offset="1" stop-color="#232733"/>
+    </linearGradient>
+    <linearGradient id="orange" x1="28" y1="56" x2="86" y2="102" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#f4753f"/>
+      <stop offset="1" stop-color="#d34210"/>
+    </linearGradient>
+    <linearGradient id="pale" x1="52" y1="20" x2="106" y2="64" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#d3d8e3"/>
+    </linearGradient>
+    <filter id="drop" x="-40%" y="-40%" width="180%" height="180%">
+      <feDropShadow dx="0" dy="3" stdDeviation="3.2" flood-color="#0b0d12" flood-opacity="0.5"/>
+    </filter>
+    <filter id="soft" x="-40%" y="-40%" width="180%" height="180%">
+      <feDropShadow dx="0" dy="1.5" stdDeviation="1.8" flood-color="#0b0d12" flood-opacity="0.3"/>
+    </filter>
+  </defs>
+
+  <rect x="8" y="8" width="112" height="112" rx="29" fill="url(#base)"/>
+  <path d="M37 9h54a28 28 0 0 1 28 28v3a28 28 0 0 0-28-28H37A28 28 0 0 0 9 40v-3A28 28 0 0 1 37 9z"
+        fill="#ffffff" fill-opacity="0.16"/>
+
+  <!-- source language, behind and above -->
+  <g filter="url(#soft)">
+    <path d="M53 20h42a11 11 0 0 1 11 11v22a11 11 0 0 1-11 11H53a11 11 0 0 1-11-11V31a11 11 0 0 1 11-11z"
+          fill="url(#pale)"/>
+    <text x="74" y="52" font-family="Ubuntu Sans, Noto Sans, DejaVu Sans, sans-serif"
+          font-size="31" font-weight="700" text-anchor="middle" fill="#2b3140">A</text>
+  </g>
+
+  <!-- translation, in front and in the Ubuntu accent -->
+  <g filter="url(#drop)">
+    <path d="M29 56h50a11 11 0 0 1 11 11v24a11 11 0 0 1-11 11H55l-13 10 2.4-10H29a11 11 0 0 1-11-11V67a11 11 0 0 1 11-11z"
+          fill="url(#orange)"/>
+    <path d="M29 56h50a11 11 0 0 1 11 11v3.5a11 11 0 0 0-11-11H29a11 11 0 0 0-11 11V67a11 11 0 0 1 11-11z"
+          fill="#ffffff" fill-opacity="0.26"/>
+    <text x="54" y="91" font-family="Noto Sans CJK SC, Source Han Sans SC, sans-serif"
+          font-size="34" font-weight="700" text-anchor="middle" fill="#ffffff">文</text>
+  </g>
+</svg>
