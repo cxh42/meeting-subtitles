@@ -10,6 +10,7 @@ link to the transcript.
 
 import json
 import logging
+import pathlib
 import socket
 import subprocess
 import threading
@@ -98,6 +99,56 @@ def port_in_use(port: int = SERVER_PORT) -> bool:
         return sock.connect_ex(("127.0.0.1", port)) == 0
 
 
+#: Markers the engine prints, latest stage first. Loading is dominated by a
+#: long stretch where nothing is logged at all, so these only bracket the
+#: silence -- :func:`disk_read_bytes` is what shows movement inside it.
+_STAGES = (
+    ("Application startup complete", "引擎即将就绪"),
+    ("Loading weights", "正在加载模型权重"),
+    ("Waiting for application startup", "正在加载模型"),
+    ("Started server process", "正在启动服务"),
+    ("WhisperLiveKit", "正在初始化 CUDA"),
+)
+
+
+def engine_stage() -> str:
+    """A human name for whatever the engine is currently doing."""
+    try:
+        text = SERVER_LOG.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return "正在启动引擎"
+    for marker, label in _STAGES:
+        if marker in text:
+            return label
+    return "正在启动引擎"
+
+
+def disk_read_bytes(pid: int) -> int | None:
+    """Bytes this process has actually read from disk, or None.
+
+    The models are about 6 GB of weights and the load is bound by reading
+    them, so this is the one number that visibly moves during the minute where
+    the log says nothing. It counts real disk reads, not page-cache hits, so
+    on a warm start it stays near zero -- which is fine, because a warm start
+    is over in seconds.
+    """
+    try:
+        for line in pathlib.Path(f"/proc/{pid}/io").read_text().splitlines():
+            if line.startswith("read_bytes:"):
+                return int(line.split(":", 1)[1])
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def human_bytes(size: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return ""
+
+
 def last_error_line(limit: int = 400) -> str:
     """Final exception line from the engine log, for the failure hint.
 
@@ -124,11 +175,11 @@ class Settings:
 
     DEFAULTS = {
         "title": "",
-        "context": "",
         "record_mic": True,
         "refine": True,
         "domain": "cs-ai",
         "font_size": 20,
+        "opacity": 94,
         "output_dir": str(paths.default_output_dir()),
     }
 
@@ -142,8 +193,12 @@ class Settings:
     def save(self) -> None:
         try:
             CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            # Only known keys: a setting that is dropped from the UI would
+            # otherwise stay in the file forever, looking like it still does
+            # something.
+            kept = {k: v for k, v in self.data.items() if k in self.DEFAULTS}
             CONFIG_PATH.write_text(
-                json.dumps(self.data, ensure_ascii=False, indent=2), encoding="utf-8"
+                json.dumps(kept, ensure_ascii=False, indent=2), encoding="utf-8"
             )
         except OSError as exc:
             logger.warning("无法保存设置: %s", exc)
@@ -257,7 +312,12 @@ class LauncherApp:
             scale=self.k, parent_bg=G.CARD, font=self._f(9))
         self.engine_button.pack(side="right", padx=(0, self._px(12)))
         status_box.render()
-        status_box.pack(anchor="w", pady=(0, self._px(18)))
+        status_box.pack(anchor="w", pady=(0, self._px(6)))
+        # Always present, painted in the window colour when stopped, so
+        # starting and stopping it never reflows the window.
+        self.progress = G.IndeterminateBar(body, width=W, scale=self.k,
+                                           parent_bg=G.WINDOW)
+        self.progress.pack(anchor="w", pady=(0, self._px(12)))
 
         # --- text fields ----------------------------------------------------
         fields = G.BoxedList(body, width=W, scale=self.k, parent_bg=G.WINDOW)
@@ -269,14 +329,6 @@ class LauncherApp:
         self.title_entry.pack(side="right", padx=(0, self._px(12)))
         self.title_entry.set(self.settings["title"])
 
-        row = fields.add_row(56)
-        tk.Label(row, text="人名与项目名", font=self._f(11), fg=G.TEXT,
-                 bg=G.CARD).pack(side="left", padx=(self._px(16), 0))
-        self.context_entry = G.Entry(row, placeholder="Anirudh, Helios",
-                                     width=170, scale=self.k, font=self._f(10),
-                                     parent_bg=G.CARD)
-        self.context_entry.pack(side="right", padx=(0, self._px(12)))
-        self.context_entry.set(self.settings["context"])
         fields.render()
         fields.pack(anchor="w", pady=(0, self._px(18)))
 
@@ -312,6 +364,17 @@ class LauncherApp:
             row, minimum=14, maximum=34, value=int(self.settings["font_size"]),
             width=175, scale=self.k, font=self._f(9), parent_bg=G.CARD)
         self.font_slider.pack(side="right", padx=(0, self._px(12)))
+
+        row = options.add_row(50)
+        tk.Label(row, text="字幕透明度", font=self._f(11), fg=G.TEXT,
+                 bg=G.CARD).pack(side="left", padx=(self._px(16), 0))
+        # Percent rather than the 0-1 the overlay takes: a slider reading
+        # "0.94" invites nudging it to 0.9 and wondering why nothing moved.
+        self.opacity_slider = G.Slider(
+            row, minimum=40, maximum=100, value=int(self.settings["opacity"]),
+            width=175, scale=self.k, font=self._f(9), parent_bg=G.CARD,
+            suffix="%")
+        self.opacity_slider.pack(side="right", padx=(0, self._px(12)))
         options.render()
         options.pack(anchor="w", pady=(0, self._px(22)))
 
@@ -329,8 +392,12 @@ class LauncherApp:
             scale=self.k, parent_bg=G.WINDOW, font=self._f(10))
         self.folder_button.pack(anchor="w")
 
+        # Two lines are reserved whatever the text says: a label that grows
+        # and shrinks resizes the whole window under the user's cursor, and
+        # the rounded mask has to chase it.
         self.hint = tk.Label(body, text="", font=self._f(8), fg=G.TEXT_DIM,
-                             bg=G.WINDOW, wraplength=self._px(W), justify="left")
+                             bg=G.WINDOW, wraplength=self._px(W), justify="left",
+                             height=2, anchor="nw")
         self.hint.pack(anchor="w", pady=(self._px(10), 0))
 
     def _drag_start(self, event) -> None:
@@ -356,6 +423,26 @@ class LauncherApp:
     def _set_status(self, text: str, colour: str) -> None:
         self.status_label.configure(text=text)
         self._status_dot.itemconfigure(self._dot, fill=colour)
+
+    def _loading_detail(self, waited: int) -> str:
+        """What to say underneath the bar while the models load.
+
+        Most of the wait is spent reading weights off disk with nothing being
+        logged, so the byte counter is the only thing that visibly moves. It
+        is the difference between "this is working" and "this is frozen", and
+        it is worth more here than any estimate would be.
+        """
+        if waited > 240:
+            return (f"加载时间明显偏长。若下面的读取量长时间不动，"
+                    f"多半是卡在联网下载模型上。\n日志: {SERVER_LOG}")
+        read = (disk_read_bytes(self.server_process.pid)
+                if self.server_process is not None else None)
+        # Under ~50 MB the models were already in the page cache and this
+        # number would only be noise; the load is quick in that case anyway.
+        if read and read > 50 * 1024 * 1024:
+            return (f"已从磁盘读取 {human_bytes(read)} 模型权重。\n"
+                    f"首次加载约 1-3 分钟，之后有系统缓存会快很多。")
+        return "模型已缓存时约 20-40 秒，冷启动 1-3 分钟。\n加载完成后「开始会议」会自动变亮。"
 
     def _set_hint(self, text: str) -> None:
         self.hint.configure(text=text)
@@ -415,11 +502,11 @@ class LauncherApp:
 
     def _persist(self) -> None:
         self.settings["title"] = self.title_entry.get()
-        self.settings["context"] = self.context_entry.get()
         self.settings["record_mic"] = self.mic_toggle.value
         self.settings["refine"] = self.refine_toggle.value
         self.settings["domain"] = "cs-ai" if self.domain_toggle.value else "general"
         self.settings["font_size"] = self.font_slider.get()
+        self.settings["opacity"] = self.opacity_slider.get()
         self.settings.save()
 
     def _on_start(self) -> None:
@@ -437,10 +524,9 @@ class LauncherApp:
             "--session-dir", str(self.session_dir),
             "--title", title,
             "--font-size", str(self.font_slider.get()),
+            "--opacity", f"{self.opacity_slider.get() / 100:.2f}",
             "--log-level", "WARNING",
         ]
-        if self.context_entry.get():
-            command += ["--context", self.context_entry.get()]
         if not self.mic_toggle.value:
             command.append("--no-mic")
         if not self.refine_toggle.value:
@@ -488,6 +574,7 @@ class LauncherApp:
             if self.meeting_process is not None and self.meeting_process.poll() is not None:
                 self._on_meeting_finished()
             else:
+                self.progress.stop()
                 self._set_status("会议进行中", gnome.SUCCESS)
                 self.start_button.set_enabled(False)
                 self.engine_button.set_text("关闭引擎")
@@ -523,9 +610,11 @@ class LauncherApp:
 
         if up:
             self.state = "ready"
+            self.progress.stop()
             self._set_status("转录引擎已就绪", gnome.SUCCESS)
             self.start_button.set_enabled(True)
             self.engine_button.set_text("关闭引擎")
+            self._set_hint("")
             return
 
         loading = listening or (
@@ -533,28 +622,22 @@ class LauncherApp:
         )
         if loading:
             self.state = "starting"
+            self.progress.start()
             waited = int(datetime.now().timestamp() - self._server_wait_started) \
                 if self._server_wait_started else 0
-            suffix = f"（已等待 {waited} 秒）" if waited else ""
-            self._set_status(f"正在加载模型…{suffix}", gnome.WARNING)
+            stage = engine_stage()
+            self._set_status(f"{stage}…（{waited} 秒）" if waited
+                             else f"{stage}…", gnome.WARNING)
             self.start_button.set_enabled(False)
             self.engine_button.set_text("关闭引擎")
-            if waited > 150:
-                # Well past a normal cold load: something is wrong, and staring
-                # at a spinner tells the user nothing.
-                self._set_hint(
-                    f"加载时间明显偏长，通常是卡在联网下载模型上。\n"
-                    f"查看日志: {SERVER_LOG}"
-                )
-            else:
-                self._set_hint("模型已缓存时约 20-40 秒；需要下载时会久一些。"
-                               "加载完成后「开始会议」按钮会自动变亮。")
+            self._set_hint(self._loading_detail(waited))
             return
 
         if self.server_process is not None:
             # We launched it and it exited without ever answering /health.
             self.server_process = None
             self.state = "offline"
+            self.progress.stop()
             self._set_status("转录引擎启动失败", gnome.ERROR)
             self.start_button.set_enabled(False)
             self.engine_button.set_text("启动引擎")
@@ -572,6 +655,7 @@ class LauncherApp:
             return
 
         self.state = "offline"
+        self.progress.stop()
         self._set_status("转录引擎未运行", gnome.ERROR)
         self.start_button.set_enabled(False)
         self.engine_button.set_text("启动引擎")

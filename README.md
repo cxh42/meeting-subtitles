@@ -102,8 +102,7 @@ at one thing to fix.
 Search for **会议字幕 / Meeting Subtitles** in your application list, or run
 `.venv/bin/meeting-subtitles`.
 
-1. Name the meeting, and optionally list names and project words that will come
-   up — they are fed to the recogniser and markedly improve proper nouns.
+1. Name the meeting; set the subtitle size and opacity to taste.
 2. The engine loads on first use (20–40 s once models are cached). **Start**
    lights up when it is ready.
 3. The launcher hides, the subtitle bar appears.

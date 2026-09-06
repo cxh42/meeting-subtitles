@@ -133,7 +133,6 @@ def shoot_launcher(out: Path) -> None:
 
     app = LauncherApp()
     app.title_entry.set("Weekly sync")
-    app.context_entry.set("Anirudh, Helios, SLO")
     # The engine is not running under Xvfb; show the state a user actually
     # sees most of the time rather than an error.
     app._set_status("转录引擎已就绪", __import__(

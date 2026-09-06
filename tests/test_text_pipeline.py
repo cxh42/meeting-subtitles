@@ -104,8 +104,24 @@ def test_context_stays_within_the_limit():
     assert len(context) <= domain.MAX_CONTEXT_CHARS
 
 
+def test_context_is_a_finished_sentence():
+    """Whisper continues the prompt's style, so the prompt must read as prose.
+
+    A bare comma-separated list makes it emit comma-separated fragments and,
+    measured on real audio, hallucinate more list before the speech starts.
+    """
+    context = domain.build_context("cs-ai", "")
+    assert context.endswith(".")
+    assert context[0].isupper()
+
+
+def test_empty_domain_gives_no_prompt():
+    """No terms must mean no prompt, not a sentence promising terms."""
+    assert domain.build_context("general", "") == ""
+
+
 def test_context_truncates_on_a_term_boundary():
     """Half a term is worse than no term: it conditions on a non-word."""
     context = domain.build_context("cs-ai", ", ".join(f"term{i}" for i in range(400)))
-    assert not context.endswith(",")
-    assert not context.rstrip().endswith(",")
+    assert not context.rstrip(".").endswith(",")
+    assert context.endswith(".")

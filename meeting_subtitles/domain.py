@@ -88,23 +88,36 @@ def get(key: str) -> Domain:
 MAX_CONTEXT_CHARS = 1000
 
 
+#: Wrapper that makes the term list read as prose. Whisper conditions on this
+#: as if it were the preceding transcript and continues in the same style, so
+#: a bare comma-separated list teaches it to emit comma-separated fragments --
+#: and, measured on real audio, to hallucinate more of the list before the
+#: speech starts ("YouTube, YouTube.com/NorthstarIT And."). Wrapping the terms
+#: in a finished sentence removes both effects.
+_PROMPT_TEMPLATE = "The following is a meeting transcript. Terms that appear: {}."
+
+
 def build_context(domain_key: str, extra: str = "") -> str:
-    """Phrase list for the ASR: the domain preset plus the user's own terms.
+    """Decoder prompt for the ASR: the domain preset plus the user's own terms.
 
     The user's terms go first -- the names of the actual participants matter
     far more than a generic vocabulary, so they must survive the length cap.
-    Truncation happens at a term boundary, never mid-word.
+    Truncation happens at a term boundary, never mid-word, and the result is
+    always a complete sentence.
     """
     parts = []
     if extra and extra.strip():
-        parts.append(extra.strip().rstrip(","))
+        parts.append(extra.strip().rstrip(",").rstrip("."))
     preset = get(domain_key).context
     if preset:
         parts.append(preset)
-    context = ", ".join(parts)
+    terms = ", ".join(parts)
+    if not terms:
+        return ""
 
-    if len(context) <= MAX_CONTEXT_CHARS:
-        return context
-    clipped = context[:MAX_CONTEXT_CHARS]
-    cut = clipped.rfind(",")
-    return clipped[:cut] if cut > 0 else clipped
+    budget = MAX_CONTEXT_CHARS - len(_PROMPT_TEMPLATE.format(""))
+    if len(terms) > budget:
+        clipped = terms[:budget]
+        cut = clipped.rfind(",")
+        terms = clipped[:cut] if cut > 0 else clipped
+    return _PROMPT_TEMPLATE.format(terms.rstrip(", "))

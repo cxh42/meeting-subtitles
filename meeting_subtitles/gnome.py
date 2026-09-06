@@ -238,6 +238,7 @@ class Slider(tk.Canvas):
         font: tuple | None = None,
         parent_bg: str = CARD,
         on_change: Callable[[int], None] | None = None,
+        suffix: str = "",
     ) -> None:
         w, h = int(width * scale), int(30 * scale)
         super().__init__(master, width=w, height=h, bg=parent_bg,
@@ -245,8 +246,11 @@ class Slider(tk.Canvas):
         self.minimum, self.maximum = minimum, maximum
         self.value = max(minimum, min(maximum, value))
         self.on_change = on_change
+        self.suffix = suffix
         self._r = int(9 * scale)
-        self._readout_w = int(30 * scale)
+        # A "%" needs a wider readout than a bare number, and a readout that
+        # overflows its box would sit on top of the track.
+        self._readout_w = int((42 if suffix else 30) * scale)
         self._x0 = self._r
         self._x1 = w - self._readout_w - self._r
         self._cy = h / 2
@@ -257,7 +261,7 @@ class Slider(tk.Canvas):
                           self._x0 + self._th, self._cy + self._th / 2, ACCENT)
         self._knob = self.create_oval(0, 0, 0, 0, fill="#ffffff", outline="")
         self._readout = self.create_text(
-            w - self._readout_w / 2, self._cy, text=str(self.value),
+            w - self._readout_w / 2, self._cy, text=f"{self.value}{suffix}",
             fill=TEXT_DIM, font=font or ("TkDefaultFont", 10))
         self._draw()
         self.bind("<Button-1>", self._drag)
@@ -270,7 +274,7 @@ class Slider(tk.Canvas):
                           max(cx, self._x0 + self._th), self._cy + self._th / 2)
         self.coords(self._knob, cx - self._r, self._cy - self._r,
                     cx + self._r, self._cy + self._r)
-        self.itemconfigure(self._readout, text=str(self.value))
+        self.itemconfigure(self._readout, text=f"{self.value}{self.suffix}")
 
     def _drag(self, event) -> None:
         span = self._x1 - self._x0
@@ -288,6 +292,62 @@ class Slider(tk.Canvas):
     def set(self, value: int) -> None:
         self.value = max(self.minimum, min(self.maximum, int(value)))
         self._draw()
+
+
+class IndeterminateBar(tk.Canvas):
+    """A sliding accent segment, for work whose duration cannot be known.
+
+    Loading the models is dominated by reading several gigabytes off disk, and
+    nothing upstream reports how far along that is. A determinate bar would
+    have to invent a number; this says only "still working", which is the
+    honest claim and the one the user actually needs.
+
+    Sized to be invisible when stopped: it keeps its space in the layout so
+    starting and stopping it never reflows the window.
+    """
+
+    def __init__(self, master: tk.Misc, *, width: int = 340,
+                 scale: float = 1.0, parent_bg: str = WINDOW) -> None:
+        # Not _w / _h: tk.Misc already uses those for the Tcl widget path,
+        # and shadowing them makes every later geometry call fail with a
+        # "bad screen distance" that names no cause.
+        self._bw = int(width * scale)
+        self._bh = max(3, int(4 * scale))
+        super().__init__(master, width=self._bw, height=self._bh, bg=parent_bg,
+                         highlightthickness=0, bd=0)
+        self._parent_bg = parent_bg
+        self._seg = max(int(self._bw * 0.28), 1)
+        self._track = Pill(self, 0, 0, self._bw, self._bh, parent_bg)
+        self._chip = Pill(self, 0, 0, self._seg, self._bh, parent_bg)
+        self._pos = 0.0
+        self._dir = 1.0
+        self._job: str | None = None
+
+    def start(self) -> None:
+        if self._job is not None:
+            return
+        self._track.configure(fill=SEPARATOR)
+        self._chip.configure(fill=ACCENT)
+        self._step()
+
+    def stop(self) -> None:
+        if self._job is not None:
+            self.after_cancel(self._job)
+            self._job = None
+        # Repainting in the parent's colour leaves the widget occupying its
+        # space without drawing anything the user can see.
+        self._track.configure(fill=self._parent_bg)
+        self._chip.configure(fill=self._parent_bg)
+
+    def _step(self) -> None:
+        travel = max(self._bw - self._seg, 1)
+        self._pos += self._dir * travel / 34.0
+        if self._pos <= 0:
+            self._pos, self._dir = 0.0, 1.0
+        elif self._pos >= travel:
+            self._pos, self._dir = float(travel), -1.0
+        self._chip.resize(self._pos, 0, self._pos + self._seg, self._bh)
+        self._job = self.after(40, self._step)
 
 
 class Button(tk.Canvas):
