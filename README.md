@@ -77,8 +77,12 @@ To check the environment after installation or diagnose a problem:
 .venv/bin/meeting-subtitles-doctor
 ```
 
-The report covers audio devices, CUDA libraries, Chinese fonts, the display,
-model caches, and other dependencies, with suggested fixes for failures.
+The report covers audio devices, CUDA libraries, free GPU memory, Chinese fonts,
+the display, model caches, and other dependencies, with suggested fixes for
+failures. The free-memory check accounts for whether the engine is already
+loaded: when there is not enough left for the refiner as well, refinement is
+skipped and says so on the caption bar, rather than leaving the engine to run
+out of memory partway through a meeting.
 
 ## Using the desktop app
 
@@ -105,9 +109,10 @@ Search for **会议字幕 / Meeting Subtitles** in the application menu, or run:
 
 ![Caption preview in light mode](docs/images/launcher-preview.png)
 
-Meeting options are remembered between sessions. The engine stays running after
-a meeting so it can be reused; **关闭引擎** stops it when you want to release its
-GPU memory.
+Meeting options are remembered between sessions, including the theme, caption
+size and opacity -- adjusting the last two from the caption bar during a meeting
+updates the launcher's sliders too. The engine stays running after a meeting so
+it can be reused; **关闭引擎** stops it when you want to release its GPU memory.
 
 ### Captions and transcript history
 
@@ -121,7 +126,7 @@ and available hardware.
 | **转录记录** | Open the transcript for the current meeting. Select text to copy it. |
 | **原文** | Show or hide the English source. |
 | **暂停显示 / 继续显示** | Pause or resume the caption display. Transcription and recording continue. |
-| **显示设置** | Adjust caption size and opacity during the meeting. |
+| **显示设置** | Adjust caption size and opacity during the meeting. Both are remembered, as is the light/dark theme. |
 | **结束并保存** | End the meeting and finish saving its files. |
 
 When you scroll up in the history window, the view stops following new text.
@@ -188,6 +193,25 @@ Restore it with:
 .venv/bin/python tools/models.py restore --from /mnt/backup/meeting-models
 ```
 
+A cache also accumulates revisions nothing points at and leftovers from
+interrupted downloads -- 7.1 GB of them on the development machine. List them
+first, then delete:
+
+```bash
+.venv/bin/python tools/models.py prune          # list only
+.venv/bin/python tools/models.py prune --yes    # delete
+```
+
+To check recognition or refinement without waiting for another meeting, replay
+a saved recording through the engine:
+
+```bash
+.venv/bin/python tools/replay.py ~/Meetings/<session>/audio.wav --seconds 60
+```
+
+It prints the recognised text, the refined text, and whether anything reached
+the network -- with the models cached, nothing should.
+
 ## Limitations
 
 - **Linux only.** Audio capture backends for macOS and Windows are not implemented.
@@ -199,6 +223,11 @@ Restore it with:
   can cause mistakes or spurious text. Review saved transcripts before reusing them.
 - **Whole-window opacity.** Tk fades both the caption background and its text.
   Increase opacity when captions are hard to read over the meeting window.
+- **Cold starts are slow.** Measured on the development machine, a first load
+  reads 12.9 GB from disk for the engine and 7.5 GB for the refiner, so it
+  usually takes one to three minutes and is much faster once the page cache is
+  warm. Nothing goes over the network once the models are cached, so no proxy
+  or VPN is needed.
 
 ## Licenses
 

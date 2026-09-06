@@ -631,9 +631,27 @@ class LauncherApp:
         self.state = "running"
         self.root.withdraw()          # get out of the way; the overlay takes over
 
+    def _reload_appearance(self) -> None:
+        """Adopt the font size and opacity the overlay was closed with.
+
+        The overlay writes them to the same settings file, so without this the
+        launcher's stale sliders would push the old values straight back on the
+        next start -- an adjustment made during a meeting would appear to be
+        remembered until the meeting after it.
+        """
+        saved = Settings()
+        for slider, key in ((self.font_slider, "font_size"),
+                            (self.opacity_slider, "opacity")):
+            try:
+                slider.set(int(saved[key]))
+            except (TypeError, ValueError):
+                continue
+            self.settings[key] = slider.get()
+
     def _on_meeting_finished(self) -> None:
         self.meeting_process = None
         self.state = "ready" if server_is_up() else "offline"
+        self._reload_appearance()
         self.root.deiconify()
         self.root.lift()
         if self.session_dir and (self.session_dir / "transcript.md").exists():

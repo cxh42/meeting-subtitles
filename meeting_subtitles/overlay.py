@@ -11,6 +11,7 @@ hands snapshots over through a queue drained by a periodic ``after`` callback.
 import logging
 import queue
 import re
+import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
@@ -84,6 +85,11 @@ class SubtitleOverlay:
         self.started_at = time.monotonic()
         self.opacity = max(0.35, min(1.0, opacity))
         self.status_text = "连接中"
+        self._notices: dict[str, str] = {}
+        self._notice_lock = threading.Lock()
+        self._notice = ""
+        self._notice_shown: str | None = None
+        self._appearance_job: str | None = None
         self._closed = False
         self._close_requested = False
         self._drag_origin = (0, 0)
@@ -171,9 +177,18 @@ class SubtitleOverlay:
             font=self.small_font, fg=self.palette.TEXT_MUTED, bg=self.palette.WINDOW, anchor="w", bd=0,
         )
         self.waiting_hint.pack(fill="x", pady=(int(5 * self.k), 0))
+        # Anything that silently degrades the meeting says so here: a refiner
+        # that never loaded, or recognition that has stopped coming back. Both
+        # used to be a log line in a process whose output goes nowhere, so the
+        # only symptom was subtitles that quietly stopped improving.
+        self.notice_label = tk.Label(
+            body, text="", font=self.small_font, fg=self.palette.WARNING,
+            bg=self.palette.WINDOW, wraplength=wrap, justify="left", anchor="w", bd=0,
+        )
 
         for widget in (body, self.final_frame, self.final_label, self.live_frame,
-                       self.source_label, self.target_label, self.waiting_hint):
+                       self.source_label, self.target_label, self.waiting_hint,
+                       self.notice_label):
             self._make_draggable(widget)
 
         # Bottom-centred, a little above the screen edge so it clears the dock.
@@ -319,6 +334,35 @@ class SubtitleOverlay:
     def _adjust_opacity(self, delta: float) -> None:
         self.opacity = max(0.35, min(1.0, self.opacity + delta))
         self._apply_opacity()
+        self._remember_appearance()
+
+    def _remember_appearance(self) -> None:
+        """Persist font size and opacity, coalescing a run of clicks.
+
+        Adjusting either is a burst of ``＋`` presses, and every press would
+        otherwise rewrite the settings file. The delay also outlives the menu,
+        which is torn down and rebuilt on each press.
+        """
+        if self._appearance_job is not None:
+            try:
+                self.root.after_cancel(self._appearance_job)
+            except tk.TclError:
+                pass
+        self._appearance_job = self.root.after(600, self._write_appearance)
+
+    def _write_appearance(self) -> None:
+        """Merge the current appearance into whatever is on disk right now.
+
+        Re-read rather than hold an instance from construction: the launcher is
+        still alive behind this window with its own copy of the settings, and
+        writing a snapshot taken minutes ago would undo whatever it saved in
+        between.
+        """
+        self._appearance_job = None
+        settings = Settings()
+        settings["font_size"] = self.font_size
+        settings["opacity"] = int(round(self.opacity * 100))
+        settings.save()
 
     def _recompute_budgets(self) -> None:
         self._caption_lines = [MAX_LINES_FINAL, MAX_LINES_SOURCE, MAX_LINES_DRAFT]
@@ -379,6 +423,7 @@ class SubtitleOverlay:
             self._render(self._last_snapshot)
         else:
             self._fit_height()
+        self._remember_appearance()
 
     def _toggle_source(self) -> None:
         self.show_source = not self.show_source
@@ -403,6 +448,36 @@ class SubtitleOverlay:
         """Called from the network thread; a plain attribute write is enough
         because ``_tick`` reads it on the Tk thread."""
         self.status_text = text
+
+    def set_notice(self, text: str, key: str = "general") -> None:
+        """Show (or with "" clear) a warning line under the subtitles.
+
+        Keyed because the two things that warn are independent: a refiner that
+        never loaded stays true for the whole meeting, while a stall comes and
+        goes. Sharing one slot meant whichever spoke last erased the other.
+
+        Called from the network thread, so the Tk side only reads a plain
+        string that this assembles under the lock -- ``_tick`` does the widget
+        work on the Tk thread.
+        """
+        with self._notice_lock:
+            if text:
+                self._notices[key] = text
+            else:
+                self._notices.pop(key, None)
+            self._notice = "\n".join(self._notices.values())
+
+    def _apply_notice(self) -> None:
+        if self._notice == self._notice_shown:
+            return
+        self._notice_shown = self._notice
+        if self._notice:
+            self.notice_label.configure(text=self._notice)
+            if not self.notice_label.winfo_manager():
+                self.notice_label.pack(fill="x", pady=(int(6 * self.k), 0))
+        else:
+            self.notice_label.pack_forget()
+        self._fit_height()
 
     def request_close(self) -> None:
         """Ask the window to close from another thread.
@@ -797,12 +872,20 @@ class SubtitleOverlay:
                   "finished": self.palette.TEXT_MUTED}.get(self.status_text, self.palette.WARNING)
         label = {"connected": "录制中", "finished": "已结束"}.get(self.status_text, self.status_text)
         self.status_label.configure(text=label, fg=colour)
+        self._apply_notice()
         self.root.after(1000, self._tick)
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
+        if self._appearance_job is not None:
+            # Closing within the coalescing delay must not lose the adjustment.
+            try:
+                self.root.after_cancel(self._appearance_job)
+            except tk.TclError:
+                pass
+            self._write_appearance()
         if self.on_close:
             self.on_close()
         try:

@@ -29,6 +29,7 @@ from meeting_subtitles.recorder import TranscriptRecorder
 from meeting_subtitles.refine import DEFAULT_MODEL, RefinementMerger, TranslationRefiner
 from meeting_subtitles.segment import resegment
 from meeting_subtitles.tkfix import ensure_cjk_tk
+from meeting_subtitles.watchdog import StallWatchdog
 
 logger = logging.getLogger("meeting")
 
@@ -133,6 +134,7 @@ class MeetingRunner:
         self.loop: asyncio.AbstractEventLoop | None = None
         self.error: BaseException | None = None
         self._last_snapshot: Snapshot | None = None
+        self.watchdog = StallWatchdog()
 
     def request_stop(self) -> None:
         """Safe to call from any thread (the Tk thread does).
@@ -150,7 +152,27 @@ class MeetingRunner:
             # The loop closed between the check above and this call.
             pass
 
+    @staticmethod
+    def _signature(snapshot: Snapshot) -> str:
+        """Everything the server can still revise, as one comparable string.
+
+        The buffers belong in it: a working engine keeps rewriting the partial
+        sentence even before it commits a line, so they are the earliest sign
+        that recognition is still alive.
+        """
+        parts = [line.text for line in snapshot.lines]
+        parts.append(snapshot.buffer_transcription)
+        parts.append(snapshot.buffer_translation)
+        return "\x1f".join(parts)
+
     def _on_snapshot(self, snapshot: Snapshot) -> None:
+        was_stalled = self.watchdog.reported
+        self.watchdog.note_text(self._signature(snapshot))
+        if was_stalled and not self.watchdog.reported:
+            # Text is moving again; leaving the warning up would be a lie.
+            logger.info("识别已恢复。")
+            if self.overlay:
+                self.overlay.set_notice("", key="stall")
         if not self.args.no_sentence_split:
             # Split first: refinement and the transcript should both work in
             # sentences, not in whatever block the speaker's pauses produced.
@@ -166,6 +188,16 @@ class MeetingRunner:
         logger.info("状态: %s", status)
         if self.overlay:
             self.overlay.set_status(status)
+
+    def _report_stall(self) -> None:
+        """Say so, loudly, rather than letting the meeting look fine."""
+        message = ("识别已停止：还在收音，但引擎超过 "
+                   f"{int(self.watchdog.stall_seconds)} 秒没有产出新文本。\n"
+                   "多半是显存被别的程序占满了。结束本场会议，用 nvidia-smi "
+                   "看看是谁，然后在启动器里重启引擎。")
+        logger.error("%s", message.replace("\n", " "))
+        if self.overlay:
+            self.overlay.set_notice(message, key="stall")
 
     async def _run(self) -> None:
         self.loop = asyncio.get_running_loop()
@@ -202,9 +234,13 @@ class MeetingRunner:
                             logger.info("收到停止信号，正在结束录制…")
                             return
                         try:
-                            yield next_task.result()
+                            chunk = next_task.result()
                         except StopAsyncIteration:
                             return
+                        self.watchdog.note_audio(chunk)
+                        if self.watchdog.take_report():
+                            self._report_stall()
+                        yield chunk
                 finally:
                     stop_task.cancel()
 
@@ -309,6 +345,24 @@ def main(argv=None) -> int:
             logger.warning("无法创建字幕窗口 (%s)，退回无窗口模式。", exc)
             overlay = None
     runner.overlay = overlay
+
+    if refiner is not None and overlay is not None:
+        def announce_refiner() -> None:
+            """Tell the user when the polish is not coming.
+
+            The load runs in the background so the meeting can start at once,
+            which also means its failure lands in a log nobody is watching --
+            the launcher starts this process with no terminal attached. Until
+            this existed, "显存不足" and "model still loading" looked identical
+            from the only place the user is looking.
+            """
+            refiner.ready.wait()
+            if refiner.failed:
+                overlay.set_notice(f"整句润色未启用，只显示流式译文。\n{refiner.failed}",
+                                   key="refine")
+
+        threading.Thread(target=announce_refiner, name="refiner-status",
+                         daemon=True).start()
 
     def handle_signal(_signum, _frame):
         logger.info("收到中断信号，正在保存转录…")

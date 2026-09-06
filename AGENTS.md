@@ -15,6 +15,9 @@ how not to break it. Long-form rationale lives in
 .venv/bin/ruff check meeting_subtitles tools tests
 .venv/bin/meeting-subtitles-engine       # the server, foreground
 ./install.sh                             # venv + deps + desktop entry
+
+.venv/bin/python tools/replay.py <audio.wav>   # re-run a meeting through the engine
+.venv/bin/python tools/models.py prune         # list dead model blobs (--yes deletes)
 ```
 
 Screenshots in `docs/images/` are generated, never hand-edited:
@@ -31,6 +34,9 @@ Screenshots in `docs/images/` are generated, never hand-edited:
   merge. `recorder.py` rewrites its files from the newest snapshot.
 - `segment.py` splits server lines into sentences; `refine.py` retranslates a
   finished sentence with a local LLM and pins it in the overlay.
+- `watchdog.py` weighs speech going in against text coming out, because the
+  server's failure mode is to stay up and stop producing. It reads no clock --
+  a PCM chunk's length is its duration -- so it is testable without a soundcard.
 - `model.py` holds the data types and imports nothing outside the stdlib.
   Keep it that way — `segment`, `recorder` and the tests depend on it.
 
@@ -51,10 +57,14 @@ Screenshots in `docs/images/` are generated, never hand-edited:
   record whatever they are doing. Make a null sink, play into it, capture its
   monitor, unload it, restore the default sink:
   `pactl load-module module-null-sink sink_name=test` … `pactl set-default-sink`.
-- **The pipeline.** The decisive tool is replaying a recorded `audio.wav`
-  through the engine and dumping raw snapshots. It separates "the server is
-  wrong" from "our processing is wrong" in one run, and it is repeatable in a
-  way that a live meeting is not.
+- **The pipeline.** The decisive tool is `tools/replay.py`: it pushes a
+  recorded `audio.wav` back through the engine and prints the snapshots. It
+  separates "the server is wrong" from "our processing is wrong" in one run, is
+  repeatable in a way that a live meeting is not, and reports whether anything
+  reached the network. Keep the default real-time pacing unless only the text
+  pipeline is under test -- the server segments on pauses, so audio pushed
+  through at full speed arrives as one block and segments nothing like the
+  meeting it came from.
 - **The GUI.** Screenshots need Xvfb: GNOME refuses the D-Bus screenshot call,
   and an XWayland window comes out black under `x11grab` because the
   compositor redirects it offscreen.
@@ -66,6 +76,21 @@ Screenshots in `docs/images/` are generated, never hand-edited:
 
 Each of these failed silently or blamed the wrong thing. All are current.
 
+- **A CUDA OOM in the ASR looks exactly like a healthy meeting.** The server
+  catches the backend exception per chunk and carries on, so the WebSocket
+  stays open, snapshots keep arriving and the transcript file stays readable --
+  it just never gains another word. The cause is usually the refiner: it is a
+  *separate process* on the same card, so its 9 GB does not fail in the process
+  that asked for it, it fails in whichever allocates next. `refine.py` checks
+  `torch.cuda.mem_get_info()` before loading, and `watchdog.py` warns when
+  speech keeps going in with no text coming back. Elapsed time cannot be the
+  trigger -- a pause is indistinguishable from a dead backend -- so only
+  seconds of audio above a speech threshold count.
+- **Two processes, one settings file, last writer wins.** The launcher stays
+  alive behind the overlay with its own copy of the settings, so an adjustment
+  made in the overlay was overwritten by the launcher's stale sliders the
+  moment the meeting ended. Both sides now re-read the file rather than saving
+  a snapshot they took minutes ago.
 - **CUDA 12 vs 13.** PyPI's `torch` now carries CUDA 13; CTranslate2 needs
   `libcublas.so.12`. The engine starts, answers `/health`, accepts audio, then
   fails every chunk and writes an empty transcript.

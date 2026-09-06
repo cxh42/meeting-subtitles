@@ -55,7 +55,7 @@ HF_HUB_OFFLINE=0 .venv/bin/python -c "from huggingface_hub import snapshot_downl
 .venv/bin/meeting-subtitles-doctor
 ```
 
-自检会检查 Python、ffmpeg、音频服务、CUDA、中文字体、显示环境和模型缓存，并给出对应的修复建议。
+自检会检查 Python、ffmpeg、音频服务、CUDA、可用显存、中文字体、显示环境和模型缓存，并给出对应的修复建议。其中「可用显存」按引擎是否已加载分别判断：显存不足以再加载润色模型时，润色会自动跳过并在字幕条上说明，而不是让引擎在会议中途因显存耗尽而停止产出。
 
 ## 使用
 
@@ -77,7 +77,7 @@ HF_HUB_OFFLINE=0 .venv/bin/python -c "from huggingface_hub import snapshot_downl
 
 ![屏幕底部的字幕预览](docs/images/launcher-preview.png)
 
-字幕条从上到下显示最近一句润色后的中文译文、实时英文原文和中文草稿。尚无润色结果或关闭润色时，只显示实时内容。「原文：开」可控制英文显示，「显示设置」可在会议中调整字号和不透明度。点击「暂停显示」只会冻结字幕画面，音频采集、识别和保存仍会继续；点击「继续显示」恢复画面更新。
+字幕条从上到下显示最近一句润色后的中文译文、实时英文原文和中文草稿。尚无润色结果或关闭润色时，只显示实时内容。「原文：开」可控制英文显示，「显示设置」可在会议中调整字号和不透明度，调整结果会被记住，下次会议和启动器里的滑块都沿用（深浅色主题同样会记住）。点击「暂停显示」只会冻结字幕画面，音频采集、识别和保存仍会继续；点击「继续显示」恢复画面更新。如果润色模型没能加载，或引擎在收音的情况下长时间不再产出文本，字幕条下方会出现橙色提示说明原因。
 
 「转录记录」按时间列出当前会议的中英文本，支持选中复制。向上滚动阅读时，新内容不会改变当前阅读位置；「回到最新」可恢复自动跟随。
 
@@ -151,6 +151,21 @@ HF_HUB_OFFLINE=0 .venv/bin/python -c "from huggingface_hub import snapshot_downl
 .venv/bin/python tools/models.py restore --from /mnt/backup/meeting-models
 ```
 
+缓存里可能积累没人使用的旧版本和中断下载的残留文件（本机曾有 7.1 GB）。先列出，确认后再删除：
+
+```bash
+.venv/bin/python tools/models.py prune          # 只列出
+.venv/bin/python tools/models.py prune --yes    # 确认后删除
+```
+
+怀疑识别或润色有问题时，可以把已保存的录音重放进引擎，不必等下一场会议：
+
+```bash
+.venv/bin/python tools/replay.py ~/Meetings/<会议目录>/audio.wav --seconds 60
+```
+
+重放会打印识别结果、润色结果，以及本次运行是否连接过外部地址——模型已缓存时应当全程离线。
+
 ## 已知限制
 
 - 目前只支持 Linux，尚未实现 macOS 和 Windows 音频采集后端。
@@ -158,6 +173,7 @@ HF_HUB_OFFLINE=0 .venv/bin/python -c "from huggingface_hub import snapshot_downl
 - 系统声音和麦克风混为一路音频，默认配置不区分说话人。
 - 口音、背景噪声、多人同时说话及长时间静音都可能影响结果；识别与翻译内容需要结合实际语境核对。
 - 整句润色需要等待句子结束，模型首次加载和显卡负载较高时也会增加延迟。
+- 首次加载是磁盘读取受限的：本机实测引擎读入 12.9 GB、润色模型读入 7.5 GB，冷启动通常 1-3 分钟；系统缓存生效后会快很多。模型已在本地时全程不联网，不需要代理或 VPN。
 - 不透明度作用于整个字幕窗口，包括文字；调得过低可能影响阅读。
 
 ## 模型许可证

@@ -12,9 +12,11 @@ that was made at some point and is easy to make again:
   mid-term, and a half term is worse than no term.
 """
 
+import array
+
 import pytest
 
-from meeting_subtitles import domain
+from meeting_subtitles import domain, watchdog
 from meeting_subtitles.cleanup import strip_non_speech
 from meeting_subtitles.segment import (
     MAX_SENTENCE_CHARS,
@@ -125,3 +127,70 @@ def test_context_truncates_on_a_term_boundary():
     context = domain.build_context("cs-ai", ", ".join(f"term{i}" for i in range(400)))
     assert not context.rstrip(".").endswith(",")
     assert context.endswith(".")
+
+
+# ----------------------------------------------------------------- watchdog
+
+def _pcm(amplitude: int, seconds: float) -> bytes:
+    """`seconds` of 16 kHz mono s16le at a constant absolute amplitude."""
+    samples = array.array("h", [amplitude, -amplitude] * int(8000 * seconds))
+    return samples.tobytes()
+
+
+def test_silence_never_stalls():
+    """A meeting is mostly pauses; a pause must not read as a broken engine."""
+    dog = watchdog.StallWatchdog(stall_seconds=10)
+    dog.note_text("nothing said yet")
+    for _ in range(600):
+        dog.note_audio(_pcm(5, 0.1))
+    assert not dog.stalled
+
+
+def test_speech_with_no_new_text_stalls():
+    dog = watchdog.StallWatchdog(stall_seconds=10)
+    dog.note_text("the last thing the server said")
+    for _ in range(120):
+        dog.note_audio(_pcm(3000, 0.1))
+    assert dog.stalled
+
+
+def test_new_text_clears_the_count():
+    dog = watchdog.StallWatchdog(stall_seconds=10)
+    dog.note_text("first")
+    for _ in range(90):
+        dog.note_audio(_pcm(3000, 0.1))
+    dog.note_text("second")
+    assert not dog.stalled
+    assert dog.speech_seconds == 0
+
+
+def test_an_unchanged_snapshot_does_not_clear_the_count():
+    """The server keeps resending the same state; only *new* text counts."""
+    dog = watchdog.StallWatchdog(stall_seconds=10)
+    for _ in range(120):
+        dog.note_text("same state every time")
+        dog.note_audio(_pcm(3000, 0.1))
+    assert dog.stalled
+
+
+def test_the_warning_is_raised_once_per_stall():
+    """The check runs per 100 ms chunk; the user must be told once."""
+    dog = watchdog.StallWatchdog(stall_seconds=1)
+    dog.note_text("start")
+    reports = 0
+    for _ in range(60):
+        dog.note_audio(_pcm(3000, 0.1))
+        reports += dog.take_report()
+    assert reports == 1
+    dog.note_text("recovered")
+    for _ in range(60):
+        dog.note_audio(_pcm(3000, 0.1))
+        reports += dog.take_report()
+    assert reports == 2
+
+
+def test_speech_level_tolerates_an_odd_trailing_byte():
+    """A short read from ffmpeg can split a sample; frombytes would raise."""
+    assert watchdog.speech_level(_pcm(3000, 0.1) + b"\x01") > 0
+    assert watchdog.speech_level(b"") == 0.0
+    assert watchdog.speech_level(b"\x01") == 0.0

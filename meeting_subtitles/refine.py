@@ -21,12 +21,66 @@ import queue
 import threading
 import time
 
+from meeting_subtitles.serve import has_snapshot, hf_cache
+
 logger = logging.getLogger(__name__)
 
 # Set before anything can import huggingface_hub in this process (see _load).
+# ``setdefault`` on purpose: HF_HUB_OFFLINE=0 in the environment is the one
+# supported way to let this process download the model, which is what the
+# README's snapshot_download line uses.
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
+# The Xet transfer backend fails behind many local proxies and buys nothing
+# for a load that is meant to be offline anyway.
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
 
 DEFAULT_MODEL = "Qwen/Qwen3-4B-Instruct-2507"
+
+#: Weight files count towards the VRAM estimate; the tokenizer and the JSON
+#: configs do not, and a stray README would skew a small model badly.
+_WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt")
+
+#: On top of the weights: CUDA context, the KV cache for one short generation,
+#: and enough slack that a transient allocation does not tip the card over.
+_VRAM_HEADROOM = 1.0 * 1024 ** 3
+_VRAM_OVERHEAD = 1.15
+
+
+def repo_dir(model_id: str) -> str:
+    """Hub cache directory name for a repo id, e.g. ``models--Qwen--Qwen3-4B``."""
+    return "models--" + model_id.replace("/", "--")
+
+
+def is_cached(model_id: str) -> bool:
+    """Whether the refiner's weights are already on this disk."""
+    directory = repo_dir(model_id)
+    return (has_snapshot(directory, "*.safetensors")
+            or has_snapshot(directory, "*.bin"))
+
+
+def weights_bytes(model_id: str) -> int:
+    """Size of the cached weight files, or 0 when the model is not cached.
+
+    Read through the snapshot links rather than from ``blobs/``: a cache can
+    hold revisions nothing points at any more -- a stale ``refs/pr/*`` copy of
+    NLLB is 5.5 GB on this machine -- and counting those would over-estimate
+    the model by a whole extra copy of itself.
+    """
+    snapshots = hf_cache() / repo_dir(model_id) / "snapshots"
+    if not snapshots.is_dir():
+        return 0
+    best = 0
+    for revision in snapshots.iterdir():
+        total = 0
+        for item in revision.rglob("*"):
+            if item.suffix in _WEIGHT_SUFFIXES:
+                try:
+                    total += item.stat().st_size
+                except OSError:
+                    pass
+        best = max(best, total)
+    return best
+
 
 SYSTEM_PROMPT = (
     "You are a professional simultaneous interpreter working in a live business "
@@ -124,6 +178,34 @@ class TranslationRefiner:
         self._model = None
         self._tokenizer = None
 
+    def _require_vram(self, torch) -> None:
+        """Refuse to load when the card cannot hold the model.
+
+        This is not a nicety. The engine is a *separate process* on the same
+        GPU, so an out-of-memory here does not fail here: the driver hands the
+        shortfall to whichever process allocates next, and that is the ASR,
+        which then throws on every single chunk while its WebSocket stays open
+        and its transcript file stays readable. The meeting looks alive and
+        silently stops producing text. Declining to load costs the polish;
+        loading anyway costs the transcript.
+        """
+        if self.device != "cuda" or not torch.cuda.is_available():
+            return
+        weights = weights_bytes(self.model_id)
+        if not weights:
+            return
+        needed = weights * _VRAM_OVERHEAD + _VRAM_HEADROOM
+        free, total = torch.cuda.mem_get_info()
+        if free >= needed:
+            return
+        gb = 1024 ** 3
+        raise RuntimeError(
+            f"显存不足：润色模型需要约 {needed / gb:.1f} GB，当前空闲 {free / gb:.1f} GB"
+            f"（显卡共 {total / gb:.1f} GB）。\n"
+            "先关掉占用显存的其他程序（nvidia-smi 可以看是谁），"
+            "或在启动器里关闭「整句润色」。"
+        )
+
     def _load(self) -> None:
         # Order matters: huggingface_hub reads HF_HUB_OFFLINE into a module
         # constant at import time, so setting it after importing transformers
@@ -132,15 +214,35 @@ class TranslationRefiner:
         # the environment first, import second.
         from meeting_subtitles.envfix import clear_proxy_env
 
-        os.environ.setdefault("HF_HUB_OFFLINE", "1")
-        clear_proxy_env()
+        cached = is_cached(self.model_id)
+        if cached:
+            # Not setdefault: whatever the desktop, the shell or an env file
+            # left behind, a model that is already on disk has nothing to
+            # fetch, and one stray HF_HUB_OFFLINE=0 is the difference between
+            # a 20 s load and a wait on a hostname that does not resolve.
+            os.environ["HF_HUB_OFFLINE"] = "1"
+            # Nothing will be fetched, so a proxy can only cause harm: httpx
+            # rejects GNOME's socks:// scheme from the *constructor*, which
+            # aborts the load while building a client that is never used.
+            clear_proxy_env()
+        elif os.environ.get("HF_HUB_OFFLINE") != "0":
+            raise RuntimeError(
+                f"本地没有润色模型 {self.model_id}，且当前是离线模式。\n"
+                "先下载一次（需要能连上 huggingface.co）：\n"
+                "  HF_HUB_OFFLINE=0 .venv/bin/python -c \"from huggingface_hub import "
+                f"snapshot_download; snapshot_download('{self.model_id}')\"\n"
+                "或在启动器里关闭「整句润色」。"
+            )
 
         # Imported lazily: a headless or --no-refine run should not pay for
         # transformers' import cost, let alone a model load.
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        logger.info("加载润色模型 %s …", self.model_id)
+        self._require_vram(torch)
+
+        logger.info("加载润色模型 %s（%s）…", self.model_id,
+                    "离线" if cached else "需要下载")
         started = time.time()
         self._tokenizer = AutoTokenizer.from_pretrained(self.model_id)
         self._model = AutoModelForCausalLM.from_pretrained(

@@ -9,6 +9,7 @@ that into a file copy.
     python tools/models.py backup  --to /mnt/backup/meeting-models
     python tools/models.py restore --from /mnt/backup/meeting-models
     python tools/models.py status
+    python tools/models.py prune
 
 Two details matter and are handled here:
 
@@ -19,7 +20,8 @@ Two details matter and are handled here:
     either way -- it resolves ``refs/<branch>`` to a revision and then reads
     ``snapshots/<revision>/<file>``, never caring whether that is a link.
 *   A repo can hold revisions nothing points at any more. Only the revisions
-    named in ``refs/`` are copied.
+    named in ``refs/`` are copied, and ``prune`` is what deletes them -- they
+    are pure waste, and on this machine they were 7.1 GB of it.
 """
 
 import argparse
@@ -214,6 +216,102 @@ def cmd_restore(args) -> int:
                     hf_cache(), whisper_cache(), "恢复")
 
 
+def prune_repo(repo: Path) -> tuple[list[Path], int]:
+    """Files in one repo that nothing will ever load, and their total size.
+
+    Two kinds accumulate, both invisible until the disk fills:
+
+    *   Revisions no ref points at any more. A ``refs/pr/*`` left over from
+        resolving a repo once holds a whole second copy of the weights -- 5.5 GB
+        of NLLB safetensors on this machine -- that nothing loads, because the
+        app asks for the repo without naming a revision.
+    *   ``*.incomplete`` blobs from a download that was interrupted. The next
+        attempt starts a new file rather than resuming this one.
+    """
+    doomed: list[Path] = []
+    keep = set(referenced_revisions(repo, all_revisions=False))
+
+    snapshots = repo / "snapshots"
+    if snapshots.is_dir():
+        for revision in sorted(snapshots.iterdir()):
+            if revision.is_dir() and revision.name not in keep:
+                doomed.append(revision)
+
+    refs = repo / "refs"
+    if refs.is_dir():
+        for ref in sorted(refs.rglob("*")):
+            if ref.is_file() and ref.read_text(encoding="utf-8").strip() not in keep:
+                doomed.append(ref)
+
+    # A blob survives only while a revision we are keeping still links to it.
+    live = set()
+    for revision in keep:
+        snapshot = snapshots / revision
+        if not snapshot.is_dir():
+            continue
+        for item in snapshot.rglob("*"):
+            if item.is_symlink() or item.is_file():
+                live.add(item.resolve())
+    blobs = repo / "blobs"
+    if blobs.is_dir():
+        for blob in sorted(blobs.iterdir()):
+            if blob.is_file() and blob.resolve() not in live:
+                doomed.append(blob)
+
+    total = 0
+    for item in doomed:
+        if item.is_dir():
+            total += sum(f.stat().st_size for f in item.rglob("*")
+                         if f.is_file() and not f.is_symlink())
+        else:
+            total += item.stat().st_size
+    return doomed, total
+
+
+def cmd_prune(args) -> int:
+    """Report reclaimable space, and delete it only when told to.
+
+    Listing is the default on purpose: this walks a cache the user may share
+    with other projects, and a wrong guess here costs a re-download, not a
+    re-run.
+    """
+    print(f"缓存: {hf_cache()}\n")
+    grand = 0
+    plans = []
+    for name in repo_names(args):
+        repo = hf_cache() / name
+        if not repo.is_dir():
+            continue
+        doomed, total = prune_repo(repo)
+        if not doomed:
+            continue
+        plans.append((name, doomed))
+        grand += total
+        print(f"{name}  可回收 {human(total)}")
+        for item in doomed:
+            kind = "旧版本" if item.parent.name == "snapshots" else (
+                "未完成" if ".incomplete" in item.name else "无引用")
+            print(f"  [{kind}] {item.relative_to(repo)}")
+        print()
+
+    if not plans:
+        print("没有可回收的文件。")
+        return 0
+    if not args.yes:
+        print(f"合计可回收 {human(grand)}。确认无误后加 --yes 执行：")
+        print("    python tools/models.py prune --yes")
+        return 0
+
+    for _name, doomed in plans:
+        for item in doomed:
+            if item.is_dir():
+                shutil.rmtree(item, ignore_errors=True)
+            else:
+                item.unlink(missing_ok=True)
+    print(f"已回收 {human(grand)}。")
+    return 0
+
+
 def cmd_status(args) -> int:
     """What is cached locally, and how big -- run this before wiping a disk."""
     print(f"Hugging Face 缓存: {hf_cache()}")
@@ -261,6 +359,10 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("status", help="列出本地已有哪些模型及大小"
                    ).set_defaults(func=cmd_status)
+
+    prune = sub.add_parser("prune", help="列出并（加 --yes 时）删除缓存里没人用的旧版本")
+    prune.add_argument("--yes", action="store_true", help="真的删除，不加只列出")
+    prune.set_defaults(func=cmd_prune)
 
     args = parser.parse_args(argv)
     return args.func(args)

@@ -37,6 +37,27 @@ def _pad(text: str, width: int = LABEL_WIDTH) -> str:
 #: Minimum interpreter. Matches whisperlivekit's own floor.
 MIN_PYTHON = (3, 11)
 
+#: Measured on this configuration: whisper large-v3 plus its CTranslate2
+#: encoder plus NLLB-1.3B, and Qwen3-4B in bfloat16 with room to generate.
+ENGINE_VRAM_GB = 14
+REFINE_VRAM_GB = 9
+
+
+def _engine_is_up(timeout: float = 2) -> bool:
+    """Health-check the engine, bypassing any configured proxy.
+
+    Without an empty ProxyHandler urllib sends 127.0.0.1 through the SOCKS
+    proxy the desktop exports, and the check fails on a running engine.
+    """
+    from urllib.error import URLError
+    from urllib.request import ProxyHandler, build_opener
+    opener = build_opener(ProxyHandler({}))
+    try:
+        with opener.open("http://127.0.0.1:8000/health", timeout=timeout) as response:
+            return response.status == 200
+    except (URLError, OSError, ValueError):
+        return False
+
 
 class Result:
     def __init__(self, status: str, label: str, detail: str = "",
@@ -206,6 +227,53 @@ def check_models() -> Result:
     return Result(OK, "模型缓存", "已就绪，可离线启动")
 
 
+def check_free_vram() -> Result:
+    """Free VRAM *right now*, which is what the next meeting actually gets.
+
+    Worth its own check because of how running out fails: the refiner and the
+    engine are separate processes on one card, so the shortfall lands on
+    whichever allocates next. That is the ASR, which then throws on every chunk
+    while its WebSocket stays open and its transcript file stays readable --
+    a meeting that looks healthy and silently stops producing text.
+    """
+    try:
+        import torch
+    except ImportError:
+        return Result(FAIL, "可用显存", "PyTorch 未安装", "pip install -e .")
+    if not torch.cuda.is_available():
+        return Result(WARN, "可用显存", "CUDA 不可用，跳过检查")
+    gb = 1024 ** 3
+    free, total = torch.cuda.mem_get_info()
+    # An engine that is already up has its ~14 GB, and asking for it twice
+    # would report a shortage on a machine that is about to work perfectly.
+    engine_up = _engine_is_up()
+    needed_engine = 0 if engine_up else ENGINE_VRAM_GB
+    detail = (f"{free / gb:.1f} GB 空闲 / 共 {total / gb:.1f} GB"
+              + ("（引擎已加载）" if engine_up else ""))
+    if free / gb < needed_engine:
+        return Result(FAIL, "可用显存", detail,
+                      f"引擎本身就需要约 {ENGINE_VRAM_GB} GB。"
+                      "用 nvidia-smi 看是谁占着，先把它关掉。")
+    if free / gb < needed_engine + REFINE_VRAM_GB:
+        return Result(WARN, "可用显存", detail,
+                      f"够跑引擎，但不够再加整句润色（约 {REFINE_VRAM_GB} GB）。\n"
+                      "润色会自动跳过并在字幕条上说明；想要润色就先腾出显存。")
+    return Result(OK, "可用显存", detail)
+
+
+def check_refine_model() -> Result:
+    """The polish model is downloaded separately, and its absence is quiet."""
+    from meeting_subtitles import refine
+    if not refine.is_cached(refine.DEFAULT_MODEL):
+        return Result(WARN, "润色模型", f"未下载 {refine.DEFAULT_MODEL}",
+                      "整句润色会自动跳过，字幕只显示流式译文。\n"
+                      "要用的话先下载一次（约 7.6 GB，需要能连上 huggingface.co）：\n"
+                      "HF_HUB_OFFLINE=0 .venv/bin/python -c \"from huggingface_hub import "
+                      f"snapshot_download; snapshot_download('{refine.DEFAULT_MODEL}')\"")
+    size = refine.weights_bytes(refine.DEFAULT_MODEL) / 1024 ** 3
+    return Result(OK, "润色模型", f"{refine.DEFAULT_MODEL}（{size:.1f} GB，可离线加载）")
+
+
 def check_tk_fonts() -> Result:
     if not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")):
         return Result(WARN, "图形界面", "当前没有图形会话",
@@ -259,15 +327,8 @@ def check_process_control() -> Result:
 
 
 def check_engine_running() -> Result:
-    from urllib.error import URLError
-    from urllib.request import ProxyHandler, build_opener
-    opener = build_opener(ProxyHandler({}))
-    try:
-        with opener.open("http://127.0.0.1:8000/health", timeout=2) as response:
-            if response.status == 200:
-                return Result(OK, "引擎状态", "正在运行")
-    except (URLError, OSError, ValueError):
-        pass
+    if _engine_is_up():
+        return Result(OK, "引擎状态", "正在运行")
     return Result(WARN, "引擎状态", "未运行",
                   "这是正常的——启动器会在需要时自动拉起。\n"
                   "也可以手动启动：meeting-subtitles-engine")
@@ -275,11 +336,12 @@ def check_engine_running() -> Result:
 
 CHECKS = (
     ("环境", [check_python, check_engine_package, check_gpu,
-              check_ctranslate2_cuda]),
+              check_ctranslate2_cuda, check_free_vram]),
     ("音频", [check_ffmpeg, check_audio_server, check_monitor_source,
               check_microphone]),
     ("界面", [check_display_server, check_tk_fonts, check_rounding]),
-    ("运行", [check_models, check_process_control, check_engine_running]),
+    ("运行", [check_models, check_refine_model, check_process_control,
+              check_engine_running]),
 )
 
 
