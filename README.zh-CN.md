@@ -166,6 +166,11 @@ NLLB 是那个流式翻译器。需要商用的话，换一个翻译后端
 - 长时间静音时 Whisper 偶尔会幻觉出一句短话。真实会议有持续的环境底噪，
   这个问题比纯数字静音下轻得多。
 
+## 改代码
+
+先看 [AGENTS.md](AGENTS.md)——命令、架构、以及这个项目里真正踩过的坑。
+各家 AI 编程工具都读它；Claude Code 通过 `CLAUDE.md` 引用同一份。
+
 ## 致谢
 
 转录引擎是 Quentin Fuxa 的 [WhisperLiveKit](https://github.com/QuentinFuxa/WhisperLiveKit)

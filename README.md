@@ -188,6 +188,12 @@ and afterwards:
   meetings have enough room tone that this is rarer than it is on digital
   silence.
 
+## Changing the code
+
+Start with [AGENTS.md](AGENTS.md) — build commands, architecture, and the
+traps that cost real time here. Every AI coding agent reads it too; Claude
+Code picks it up through `CLAUDE.md`.
+
 ## Credits
 
 The transcription engine is [WhisperLiveKit](https://github.com/QuentinFuxa/WhisperLiveKit)
