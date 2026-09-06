@@ -21,7 +21,6 @@ import argparse
 import os
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -90,22 +89,17 @@ def capture(window, path: Path, settle: float = 1.5) -> None:
 
 
 def pump(window, seconds: float) -> None:
-    """Keep Tk redrawing without entering its mainloop."""
-    end = time.monotonic() + seconds
-    while time.monotonic() < end:
-        try:
-            window.update()
-        except Exception:
-            return
-        time.sleep(0.02)
+    """Run the same event loop that delivers worker callbacks in the app."""
+    window.after(int(seconds * 1000), window.quit)
+    window.mainloop()
 
 
-def shoot_overlay(out: Path) -> None:
+def shoot_overlay(out: Path, theme: str = "light") -> None:
     from meeting_subtitles.model import Line, Snapshot
     from meeting_subtitles.overlay import SubtitleOverlay
 
     overlay = SubtitleOverlay(on_close=lambda: None, font_size=17,
-                              width_ratio=0.92, opacity=1.0)
+                              width_ratio=0.92, opacity=1.0, theme=theme)
     snapshot = Snapshot(
         lines=[Line(speaker=0, **line) for line in LINES],
         buffer_transcription=BUFFER_TEXT,
@@ -113,7 +107,6 @@ def shoot_overlay(out: Path) -> None:
         status="active_transcription",
     )
     overlay.push(snapshot)
-    overlay._drain()
     overlay.set_status("connected")
     capture(overlay.root, out / "subtitle-bar.png")
 
@@ -128,20 +121,23 @@ def shoot_overlay(out: Path) -> None:
         pass
 
 
-def shoot_launcher(out: Path) -> None:
+def shoot_launcher(out: Path, theme: str = "light") -> None:
     from meeting_subtitles.launcher import LauncherApp
 
-    app = LauncherApp()
-    app.title_entry.set("Weekly sync")
-    # The engine is not running under Xvfb; show the state a user actually
-    # sees most of the time rather than an error.
-    app._set_status("转录引擎已就绪", __import__(
-        "meeting_subtitles.gnome", fromlist=["SUCCESS"]).SUCCESS)
-    app.start_button.set_enabled(True)
-    app._set_hint("")
+    app = LauncherApp(preview=True, theme=theme)
+    app.title_entry.set("每周项目同步")
+    app.font_slider.set(20)
+    app.opacity_slider.set(94)
+    app.mic_toggle.set(True)
+    app.refine_toggle.set(True)
+    app.domain_toggle.set(True)
+    app._update_preview()
+    app._apply_state(True, True)
     capture(app.root, out / "launcher.png")
+    app._show_preview()
+    capture(app._preview_window, out / "launcher-preview.png")
     try:
-        app.root.destroy()
+        app._on_window_close()
     except Exception:
         pass
 
@@ -149,6 +145,8 @@ def shoot_launcher(out: Path) -> None:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--out", default="docs/images", type=Path)
+    parser.add_argument("--theme", choices=("light", "dark", "both"), default="both",
+                        help="截图外观（默认生成浅色和深色两套）")
     args = parser.parse_args(argv)
 
     if not os.environ.get("DISPLAY"):
@@ -158,8 +156,11 @@ def main(argv: list[str] | None = None) -> int:
     ensure_cjk_tk(module=None)
 
     print("生成截图:")
-    shoot_launcher(args.out)
-    shoot_overlay(args.out)
+    themes = ("light", "dark") if args.theme == "both" else (args.theme,)
+    for theme in themes:
+        out = args.out if theme == "light" else args.out / "dark"
+        shoot_launcher(out, theme)
+        shoot_overlay(out, theme)
     return 0
 
 

@@ -1,48 +1,32 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
   <defs>
-    <!-- Yaru / GNOME 45+ app icons are a rounded square with a soft top-lit
-         gradient, a one-pixel lit edge and real drop shadows. Flat shapes on a
-         flat fill are what make a hand-drawn icon look unfinished. -->
-    <linearGradient id="base" x1="64" y1="8" x2="64" y2="120" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#4e5567"/>
-      <stop offset="0.55" stop-color="#353b4b"/>
-      <stop offset="1" stop-color="#232733"/>
+    <linearGradient id="surface" x1="28" y1="8" x2="102" y2="120" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#3d464d"/>
+      <stop offset="1" stop-color="#24292d"/>
     </linearGradient>
-    <linearGradient id="orange" x1="28" y1="56" x2="86" y2="102" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#f4753f"/>
-      <stop offset="1" stop-color="#d34210"/>
+    <linearGradient id="translation" x1="24" y1="58" x2="84" y2="108" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#447ba4"/>
+      <stop offset="1" stop-color="#345f84"/>
     </linearGradient>
-    <linearGradient id="pale" x1="52" y1="20" x2="106" y2="64" gradientUnits="userSpaceOnUse">
-      <stop offset="0" stop-color="#ffffff"/>
-      <stop offset="1" stop-color="#d3d8e3"/>
-    </linearGradient>
-    <filter id="drop" x="-40%" y="-40%" width="180%" height="180%">
-      <feDropShadow dx="0" dy="3" stdDeviation="3.2" flood-color="#0b0d12" flood-opacity="0.5"/>
-    </filter>
-    <filter id="soft" x="-40%" y="-40%" width="180%" height="180%">
-      <feDropShadow dx="0" dy="1.5" stdDeviation="1.8" flood-color="#0b0d12" flood-opacity="0.3"/>
-    </filter>
   </defs>
 
-  <rect x="8" y="8" width="112" height="112" rx="29" fill="url(#base)"/>
-  <path d="M37 9h54a28 28 0 0 1 28 28v3a28 28 0 0 0-28-28H37A28 28 0 0 0 9 40v-3A28 28 0 0 1 37 9z"
-        fill="#ffffff" fill-opacity="0.16"/>
+  <rect x="8" y="10" width="112" height="112" rx="29" fill="#080d13" fill-opacity="0.24"/>
+  <rect x="8" y="7" width="112" height="112" rx="29" fill="url(#surface)"/>
+  <rect x="8.75" y="7.75" width="110.5" height="110.5" rx="28.25"
+        fill="none" stroke="#a9b8c8" stroke-opacity="0.18" stroke-width="1.5"/>
 
-  <!-- source language, behind and above -->
-  <g filter="url(#soft)">
-    <path d="M53 20h42a11 11 0 0 1 11 11v22a11 11 0 0 1-11 11H53a11 11 0 0 1-11-11V31a11 11 0 0 1 11-11z"
-          fill="url(#pale)"/>
-    <text x="74" y="52" font-family="Ubuntu Sans, Noto Sans, DejaVu Sans, sans-serif"
-          font-size="31" font-weight="700" text-anchor="middle" fill="#2b3140">A</text>
-  </g>
+  <!-- Language marks are paths so the desktop icon needs no installed fonts. -->
+  <path d="M57 25h38a12 12 0 0 1 12 12v20a12 12 0 0 1-12 12H57a12 12 0 0 1-12-12V37a12 12 0 0 1 12-12Z"
+        fill="#080d13" fill-opacity="0.2" transform="translate(0 3)"/>
+  <path d="M57 25h38a12 12 0 0 1 12 12v20a12 12 0 0 1-12 12H57a12 12 0 0 1-12-12V37a12 12 0 0 1 12-12Z"
+        fill="#f4f4f1"/>
+  <path d="m65 57 9-25h5l9 25h-6l-1.7-5.5h-8L70.5 57Zm8.7-10h5.2l-2.6-8.3Z"
+        fill="#243241" fill-rule="evenodd"/>
 
-  <!-- translation, in front and in the Ubuntu accent -->
-  <g filter="url(#drop)">
-    <path d="M29 56h50a11 11 0 0 1 11 11v24a11 11 0 0 1-11 11H55l-13 10 2.4-10H29a11 11 0 0 1-11-11V67a11 11 0 0 1 11-11z"
-          fill="url(#orange)"/>
-    <path d="M29 56h50a11 11 0 0 1 11 11v3.5a11 11 0 0 0-11-11H29a11 11 0 0 0-11 11V67a11 11 0 0 1 11-11z"
-          fill="#ffffff" fill-opacity="0.26"/>
-    <text x="54" y="91" font-family="Noto Sans CJK SC, Source Han Sans SC, sans-serif"
-          font-size="34" font-weight="700" text-anchor="middle" fill="#ffffff">文</text>
-  </g>
+  <path d="M32 57h49a12 12 0 0 1 12 12v22a12 12 0 0 1-12 12H54l-14 9v-9h-8a12 12 0 0 1-12-12V69a12 12 0 0 1 12-12Z"
+        fill="#080d13" fill-opacity="0.28" transform="translate(0 3)"/>
+  <path d="M32 57h49a12 12 0 0 1 12 12v22a12 12 0 0 1-12 12H54l-14 9v-9h-8a12 12 0 0 1-12-12V69a12 12 0 0 1 12-12Z"
+        fill="url(#translation)"/>
+  <path d="M42 71h29v19H42Zm4.5 4.5v10h20v-10Z" fill="#ffffff" fill-rule="evenodd"/>
+  <path d="M54 65h5v32h-5Z" fill="#ffffff"/>
 </svg>

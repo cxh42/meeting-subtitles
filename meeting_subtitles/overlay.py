@@ -10,24 +10,19 @@ hands snapshots over through a queue drained by a periodic ``after`` callback.
 
 import logging
 import queue
+import re
 import time
 import tkinter as tk
 import tkinter.font as tkfont
 from collections.abc import Callable
 
+from meeting_subtitles import gnome as ui
 from meeting_subtitles.gnome import screen_scale
 from meeting_subtitles.model import Snapshot
 from meeting_subtitles.rounded import RoundedWindow, undecorate
+from meeting_subtitles.settings import Settings
 
 logger = logging.getLogger(__name__)
-
-BG = "#1c1c1c"
-FG_SOURCE = "#f4f6fb"
-FG_TARGET = "#ff9f6b"
-FG_PENDING = "#9a9a9a"
-FG_MUTED = "#787878"
-TOOLBAR_BG = "#222222"
-DIVIDER = "#3a3a3a"
 
 CJK_FONTS = ("Noto Sans CJK SC", "Noto Sans CJK JP", "Source Han Sans SC",
              "WenQuanYi Micro Hei", "Droid Sans Fallback")
@@ -76,10 +71,14 @@ class SubtitleOverlay:
         font_size: int = 19,
         width_ratio: float = 0.78,
         opacity: float = 0.94,
+        theme: str | None = None,
     ) -> None:
+        self.theme = theme if theme is not None else Settings()["theme"]
+        self.palette = ui.get_palette(self.theme)
+        self._draft_color = "#c9cfd2" if self.theme == "dark" else "#414b51"
         self.queue: queue.Queue[Snapshot] = queue.Queue()
         self.on_close = on_close
-        self.font_size = font_size
+        self.font_size = max(11, min(46, font_size))
         self.show_source = True
         self.paused = False
         self.started_at = time.monotonic()
@@ -89,11 +88,16 @@ class SubtitleOverlay:
         self._close_requested = False
         self._drag_origin = (0, 0)
         self._final_text = ""
+        self._last_snapshot: Snapshot | None = None
+        self._paused_snapshot: Snapshot | None = None
         self._history_window: tk.Toplevel | None = None
         self._history_text: tk.Text | None = None
         self._history_rounded = None
         self._status_pill: tk.Label | None = None
         self._jump_button: tk.Button | None = None
+        self._history_count: tk.Label | None = None
+        self._history_empty: tk.Frame | None = None
+        self._display_menu: tk.Menu | None = None
         self._rendered: list = []
         self._frozen = False
         self._pending = 0
@@ -104,62 +108,72 @@ class SubtitleOverlay:
         # in the dash, and for grouping. Tk's default is the bare "Tk", which
         # every other Tk program on the system also claims.
         self.root = tk.Tk(className="meeting-subtitles")
-        self.root.title("Meeting Subtitles")
+        self.root.title("会议字幕")
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
         self._apply_opacity()
-        self.root.configure(bg=BG)
+        self.root.configure(bg=self.palette.WINDOW)
 
         # Canvas/padding geometry is in pixels but fonts scale with DPI; grow
         # both together so the bar is not cramped on a HiDPI panel.
         self.k = screen_scale(self.root)
         family = _pick_font(self.root)
-        self.source_font = tkfont.Font(family=family, size=self.font_size)
-        self.target_font = tkfont.Font(family=family, size=self.font_size + 2, weight="bold")
+        self.source_font = tkfont.Font(family=family, size=max(11, self.font_size - 3))
+        self.target_font = tkfont.Font(family=family, size=self.font_size)
         self.draft_font = tkfont.Font(family=family, size=self.font_size)
         self.small_font = tkfont.Font(family=family, size=10)
-        self.history_font = tkfont.Font(family=family, size=max(11, self.font_size - 4))
+        self.caption_font = tkfont.Font(family=family, size=9)
+        self.heading_font = tkfont.Font(family=family, size=13, weight="bold")
+        self.history_font = tkfont.Font(family=family, size=12)
+        self.history_target_font = tkfont.Font(family=family, size=14)
 
         screen_w = self.root.winfo_screenwidth()
         screen_h = self.root.winfo_screenheight()
-        self.width = int(screen_w * width_ratio)
-        self._pad_x = int(16 * self.k)
-        wrap = self.width - 2 * self._pad_x
+        self.width = min(screen_w - int(24 * self.k),
+                         max(int(580 * self.k), int(screen_w * width_ratio)))
+        self._pad_x = int(24 * self.k)
+        self._text_inset = 0
+        wrap = self.width - 2 * self._pad_x - self._text_inset
 
         self._recompute_budgets()
         self._build_toolbar()
 
-        body = tk.Frame(self.root, bg=BG)
+        body = tk.Frame(self.root, bg=self.palette.WINDOW)
         body.pack(fill="both", expand=True, padx=self._pad_x,
-                  pady=(int(6 * self.k), int(12 * self.k)))
+                  pady=(int(12 * self.k), int(16 * self.k)))
         self.body = body
 
-        # Row 1: the most recent fully re-translated sentence. It stays until
-        # the next one is ready, so the polished Chinese is actually readable --
-        # previously it appeared only while the next sentence was still short
-        # and flashed past before it could be read.
+        self.final_frame = tk.Frame(body, bg=self.palette.WINDOW)
         self.final_label = tk.Label(
-            body, text="", font=self.target_font, fg=FG_TARGET, bg=BG,
-            wraplength=wrap, justify="left", anchor="w",
+            self.final_frame, text="", font=self.target_font,
+            fg=self.palette.TEXT, bg=self.palette.WINDOW,
+            wraplength=wrap, justify="left", anchor="w", bd=0, padx=0,
         )
         self.final_label.pack(fill="x")
 
-        self.divider = tk.Frame(body, bg=DIVIDER, height=max(1, int(self.k)))
-
-        # Row 2/3: what is being said right now, and its rough draft.
+        self.divider = tk.Frame(body, bg=self.palette.SEPARATOR, height=1)
+        self.live_frame = tk.Frame(body, bg=self.palette.WINDOW)
+        self.live_frame.pack(fill="x")
         self.source_label = tk.Label(
-            body, text="", font=self.source_font, fg=FG_SOURCE, bg=BG,
-            wraplength=wrap, justify="left", anchor="w",
+            self.live_frame, text="", font=self.source_font,
+            fg=self.palette.TEXT_DIM, bg=self.palette.WINDOW,
+            wraplength=wrap, justify="left", anchor="w", bd=0, padx=0,
         )
         self.source_label.pack(fill="x")
-
         self.target_label = tk.Label(
-            body, text="等待语音…", font=self.draft_font, fg=FG_PENDING, bg=BG,
-            wraplength=wrap, justify="left", anchor="w", pady=int(2 * self.k),
+            self.live_frame, text="等待语音…", font=self.draft_font,
+            fg=self._draft_color, bg=self.palette.WINDOW, wraplength=wrap, justify="left", anchor="w",
+            bd=0, padx=0, pady=int(3 * self.k),
         )
         self.target_label.pack(fill="x")
+        self.waiting_hint = tk.Label(
+            body, text="播放会议声音后，英文原文与中文翻译会显示在这里。",
+            font=self.small_font, fg=self.palette.TEXT_MUTED, bg=self.palette.WINDOW, anchor="w", bd=0,
+        )
+        self.waiting_hint.pack(fill="x", pady=(int(5 * self.k), 0))
 
-        for widget in (body, self.final_label, self.source_label, self.target_label):
+        for widget in (body, self.final_frame, self.final_label, self.live_frame,
+                       self.source_label, self.target_label, self.waiting_hint):
             self._make_draggable(widget)
 
         # Bottom-centred, a little above the screen edge so it clears the dock.
@@ -176,7 +190,7 @@ class SubtitleOverlay:
 
         # GNOME rounds every window it decorates; a frameless bar with square
         # corners is the one thing on screen that looks unfinished.
-        self._rounded = RoundedWindow(self.root, radius=int(14 * self.k))
+        self._rounded = RoundedWindow(self.root, radius=int(10 * self.k))
         # Drive the mask from <Configure> rather than from the code that asks
         # for a new size: a shape set before X has actually resized the window
         # is clipped to the old geometry and never catches up, which left the
@@ -194,44 +208,83 @@ class SubtitleOverlay:
 
     def _build_toolbar(self) -> None:
         k = self.k
-        bar = tk.Frame(self.root, bg=TOOLBAR_BG, height=int(28 * k))
-        bar.pack(fill="x", side="top")
+        bar = tk.Frame(self.root, bg=self.palette.HEADERBAR)
+        bar.pack(fill="x", side="top", padx=int(12 * k), pady=int(3 * k))
         self._make_draggable(bar)
-
+        identity = tk.Frame(bar, bg=self.palette.HEADERBAR)
+        identity.pack(side="left", padx=(int(8 * k), int(8 * k)))
+        self._make_draggable(identity)
         self.status_label = tk.Label(
-            bar, text="● 连接中", font=self.small_font, fg=FG_MUTED, bg=TOOLBAR_BG,
+            identity, text="连接中", font=self.small_font,
+            fg=self.palette.WARNING, bg=self.palette.HEADERBAR, bd=0,
         )
-        self.status_label.pack(side="left", padx=(int(12 * k), int(8 * k)),
-                               pady=int(4 * k))
-        self._make_draggable(self.status_label)
-
+        self.status_label.pack(side="left")
         self.timer_label = tk.Label(
-            bar, text="00:00", font=self.small_font, fg=FG_MUTED, bg=TOOLBAR_BG,
+            identity, text="00:00", font=self.small_font,
+            fg=self.palette.TEXT_MUTED, bg=self.palette.HEADERBAR, bd=0,
         )
-        self.timer_label.pack(side="left")
-        self._make_draggable(self.timer_label)
+        self.timer_label.pack(side="left", padx=(int(12 * k), 0))
+        for widget in (self.status_label, self.timer_label):
+            self._make_draggable(widget)
 
-        def button(text: str, command, tooltip: str = "") -> tk.Button:
+        controls = tk.Frame(bar, bg=self.palette.HEADERBAR)
+        controls.pack(side="right")
+
+        def button(label: str, command) -> tk.Button:
             btn = tk.Button(
-                bar, text=text, font=self.small_font, command=command,
-                fg=FG_SOURCE, bg=TOOLBAR_BG, activebackground="#232a38",
-                activeforeground=FG_SOURCE, relief="flat", bd=0,
-                padx=int(8 * k), pady=1, highlightthickness=0, cursor="hand2",
+                controls, text=label, font=self.small_font, command=command,
+                fg=self.palette.TEXT_DIM, bg=self.palette.HEADERBAR, activebackground=self.palette.HOVER,
+                activeforeground=self.palette.TEXT, relief="flat", bd=0,
+                padx=int(8 * k), pady=int(4 * k), cursor="hand2",
+                highlightthickness=1, highlightbackground=self.palette.HEADERBAR,
+                highlightcolor=self.palette.ACCENT,
             )
-            btn.pack(side="right", padx=int(2 * k), pady=int(3 * k))
+            btn.pack(side="left", padx=int(2 * k))
+            btn.bind("<Enter>", lambda _e: btn.configure(bg=self.palette.HOVER))
+            btn.bind("<Leave>", lambda _e: btn.configure(bg=self.palette.HEADERBAR))
             return btn
 
-        # "结束并保存" is the real action; a bare ✕ reads as "hide the bar" and
-        # left no obvious way to finish the recording.
-        end = button("结束并保存", self.close)
-        end.configure(fg="#ffb4a8")
-        button("A+", lambda: self._resize_font(+2))
-        button("A−", lambda: self._resize_font(-2))
-        button("◐+", lambda: self._adjust_opacity(+0.06))
-        button("◐−", lambda: self._adjust_opacity(-0.06))
-        self.source_button = button("原文", self._toggle_source)
-        self.pause_button = button("暂停", self._toggle_pause)
-        button("历史", self.show_history)
+        button("转录记录", self.show_history)
+        self.source_button = button("原文：开", self._toggle_source)
+        self.pause_button = button("暂停显示", self._toggle_pause)
+        self.display_button = button("显示设置", self._show_display_menu)
+        divider = tk.Frame(controls, bg=self.palette.SEPARATOR, width=1, height=int(18 * k))
+        divider.pack(side="left", padx=int(10 * k))
+        button("结束并保存", self.close)
+
+        # A second row preserves all actions on compact displays without
+        # changing the user's requested subtitle width.
+        self.root.update_idletasks()
+        if bar.winfo_reqwidth() + int(24 * k) > self.width:
+            identity.pack_forget()
+            controls.pack_forget()
+            identity.pack(anchor="w", pady=(0, int(6 * k)))
+            controls.pack(anchor="e")
+        tk.Frame(self.root, bg=self.palette.SEPARATOR, height=1).pack(fill="x")
+
+    def _show_display_menu(self) -> None:
+        if self._display_menu is not None:
+            self._display_menu.destroy()
+        menu = tk.Menu(
+            self.root, tearoff=False, bg=self.palette.WINDOW, fg=self.palette.TEXT,
+            activebackground=self.palette.HOVER, activeforeground=self.palette.TEXT,
+            disabledforeground=self.palette.TEXT_MUTED, bd=1, relief="solid",
+            font=self.small_font,
+        )
+        self._display_menu = menu
+        menu.add_command(label=f"字号  {self.font_size}", state="disabled")
+        menu.add_command(label="放大字号    ＋", command=lambda: self._resize_font(2))
+        menu.add_command(label="缩小字号    −", command=lambda: self._resize_font(-2))
+        menu.add_separator()
+        menu.add_command(label=f"不透明度  {self.opacity:.0%}", state="disabled")
+        menu.add_command(label="更不透明    ＋", command=lambda: self._adjust_opacity(0.06))
+        menu.add_command(label="更透明        −", command=lambda: self._adjust_opacity(-0.06))
+        try:
+            menu.tk_popup(self.display_button.winfo_rootx(),
+                          self.display_button.winfo_rooty()
+                          + self.display_button.winfo_height())
+        finally:
+            menu.grab_release()
 
     def _make_draggable(self, widget: tk.Misc) -> None:
         widget.bind("<Button-1>", self._drag_start)
@@ -267,49 +320,84 @@ class SubtitleOverlay:
         self.opacity = max(0.35, min(1.0, self.opacity + delta))
         self._apply_opacity()
 
-    def _char_budget(self, font: tkfont.Font, lines: int) -> int:
-        """How many characters of this font fit in ``lines`` wrapped rows.
-
-        Measured against a mixed sample so it lands between the width of Latin
-        text and the much wider CJK glyphs, rather than assuming either.
-        """
-        sample = "the model 模型 attention 注意力 "
-        try:
-            per_char = max(font.measure(sample) / len(sample), 1.0)
-        except tk.TclError:
-            per_char = float(self.font_size)
-        wrap = max(self.width - 2 * self._pad_x, 100)
-        # Wrapping never fills the last row completely; 0.92 keeps the estimate
-        # from promising a row that does not exist.
-        return max(20, int(wrap * lines * 0.92 / per_char))
-
     def _recompute_budgets(self) -> None:
-        self._budget_final = self._char_budget(self.target_font, MAX_LINES_FINAL)
-        self._budget_source = self._char_budget(self.source_font, MAX_LINES_SOURCE)
-        self._budget_draft = self._char_budget(self.draft_font, MAX_LINES_DRAFT)
+        self._caption_lines = [MAX_LINES_FINAL, MAX_LINES_SOURCE, MAX_LINES_DRAFT]
+        fonts = (self.target_font, self.source_font, self.draft_font)
+        line_heights = [font.metrics("linespace") for font in fonts]
+        available = self.root.winfo_screenheight() * 0.5 - int(140 * self.k)
+        # At large font sizes, fewer complete rows are more useful than a
+        # tall label whose bottom half is hidden by the screen-height guard.
+        for index in (1, 2, 0):
+            if sum(rows * height for rows, height in zip(self._caption_lines, line_heights, strict=True)) <= available:
+                break
+            self._caption_lines[index] = 1
+
+    def _clip_caption(self, value: str, font: tkfont.Font, rows: int) -> str:
+        width = max(40, self.width - 2 * self._pad_x - self._text_inset)
+
+        def fits(candidate: str) -> bool:
+            count, used = 1, 0
+            for word in re.findall(r"\n|[^\S\n]+|[^\s]+", candidate):
+                if word == "\n":
+                    count, used = count + 1, 0
+                else:
+                    measured = font.measure(word)
+                    if measured <= width:
+                        if used and used + measured > width:
+                            count, used = count + 1, 0
+                        used += measured
+                    else:
+                        for char in word:
+                            measured_char = font.measure(char)
+                            if used and used + measured_char > width:
+                                count, used = count + 1, 0
+                            used += measured_char
+                if count > rows:
+                    return False
+            return True
+
+        value = value.strip()
+        if fits(value):
+            return value
+        low, high = 0, len(value)
+        while low < high:
+            middle = (low + high + 1) // 2
+            if fits("… " + value[-middle:]):
+                low = middle
+            else:
+                high = middle - 1
+        return _tail(value, max(1, low))
 
     def _resize_font(self, delta: int) -> None:
         self.font_size = max(11, min(46, self.font_size + delta))
-        self.source_font.configure(size=self.font_size)
-        self.target_font.configure(size=self.font_size + 2)
+        self.source_font.configure(size=max(11, self.font_size - 3))
+        self.target_font.configure(size=self.font_size)
         self.draft_font.configure(size=self.font_size)
         self._recompute_budgets()
-        self._final_text = ""          # force the pinned row to be re-clipped
-        self._fit_height()
+        self._final_text = ""
+        if self._last_snapshot is not None:
+            self._render(self._last_snapshot)
+        else:
+            self._fit_height()
 
     def _toggle_source(self) -> None:
         self.show_source = not self.show_source
         if self.show_source:
             self.source_label.pack(fill="x", before=self.target_label)
-            self.source_button.configure(fg=FG_SOURCE)
+            self.source_button.configure(text="原文：开", fg=self.palette.TEXT_DIM)
         else:
             self.source_label.pack_forget()
-            self.source_button.configure(fg=FG_MUTED)
+            self.source_button.configure(text="原文：关", fg=self.palette.TEXT_MUTED)
         self._fit_height()
 
     def _toggle_pause(self) -> None:
         self.paused = not self.paused
-        self.pause_button.configure(text="继续" if self.paused else "暂停")
+        self.pause_button.configure(text="继续显示" if self.paused else "暂停显示",
+                                    fg=self.palette.WARNING if self.paused else self.palette.TEXT_DIM)
+        if not self.paused and self._paused_snapshot is not None:
+            self._render(self._paused_snapshot)
+            self._paused_snapshot = None
+            self._fill_history()
 
     def set_status(self, text: str) -> None:
         """Called from the network thread; a plain attribute write is enough
@@ -341,7 +429,9 @@ class SubtitleOverlay:
                 latest = self.queue.get_nowait()
         except queue.Empty:
             pass
-        if latest is not None and not self.paused:
+        if latest is not None and self.paused:
+            self._paused_snapshot = latest
+        elif latest is not None:
             self._render(latest)
             if self._history_window is not None and self._history_window.winfo_exists() \
                     and self._history_window.state() != "withdrawn":
@@ -349,10 +439,25 @@ class SubtitleOverlay:
         self.root.after(100, self._drain)
 
     def _render(self, snapshot: Snapshot) -> None:
+        self._last_snapshot = snapshot
         speech = snapshot.speech_lines
-        if not speech:
-            return
         self.history = speech
+        if not speech:
+            self._final_text = ""
+            self.final_frame.pack_forget()
+            self.divider.pack_forget()
+            self.source_label.configure(text=self._clip_caption(
+                snapshot.buffer_transcription, self.source_font, self._caption_lines[1]))
+            self.target_label.configure(text=self._clip_caption(
+                snapshot.buffer_translation, self.draft_font, self._caption_lines[2])
+                or "等待语音…")
+            if snapshot.buffer_transcription or snapshot.buffer_translation:
+                self.waiting_hint.pack_forget()
+            elif not self.waiting_hint.winfo_manager():
+                self.waiting_hint.pack(fill="x", pady=(int(5 * self.k), 0))
+            self._fit_height()
+            return
+        self.waiting_hint.pack_forget()
 
         # The pinned row holds the newest sentence that has been re-translated
         # in full. It is deliberately *not* cleared when the speaker moves on:
@@ -362,13 +467,19 @@ class SubtitleOverlay:
             if line.refined and line.translation.strip():
                 newest_final = line
                 break
-        if newest_final is not None and newest_final.text != self._final_text:
+        if newest_final is not None:
             self._final_text = newest_final.text
             self.final_label.configure(
-                text=_tail(newest_final.translation, self._budget_final))
-            if not self.divider.winfo_ismapped():
-                self.divider.pack(fill="x", pady=int(6 * self.k),
-                                  before=self.source_label)
+                text=self._clip_caption(newest_final.translation, self.target_font,
+                                        self._caption_lines[0]))
+            if not self.final_frame.winfo_manager():
+                self.final_frame.pack(fill="x", before=self.live_frame)
+                self.divider.pack(fill="x", pady=int(10 * self.k),
+                                  before=self.live_frame)
+        else:
+            self._final_text = ""
+            self.final_frame.pack_forget()
+            self.divider.pack_forget()
 
         # The live rows always track the sentence in progress, even when it is
         # the same one that is pinned above -- the reader follows the English
@@ -385,10 +496,11 @@ class SubtitleOverlay:
             if snapshot.buffer_translation:
                 draft = f"{draft} {snapshot.buffer_translation.strip()}".strip()
 
-        self.source_label.configure(text=_tail(source, self._budget_source))
+        self.source_label.configure(
+            text=self._clip_caption(source, self.source_font, self._caption_lines[1]))
         self.target_label.configure(
-            text=_tail(draft, self._budget_draft) if draft else "",
-            fg=FG_PENDING,
+            text=self._clip_caption(draft, self.draft_font, self._caption_lines[2]) if draft else "",
+            fg=self._draft_color,
         )
         self._fit_height()
 
@@ -401,18 +513,22 @@ class SubtitleOverlay:
             return
 
         window = tk.Toplevel(self.root)
-        window.title("本次转录")
-        window.configure(bg=BG)
+        window.title("转录记录 · 会议字幕")
+        window.configure(bg=self.palette.WINDOW)
         window.attributes("-topmost", True)
-        width = int(min(self.width, self.root.winfo_screenwidth() * 0.62))
-        height = int(self.root.winfo_screenheight() * 0.62)
-        window.geometry(f"{width}x{height}")
+        screen_w, screen_h = self.root.winfo_screenwidth(), self.root.winfo_screenheight()
+        width = int(min(max(700 * self.k, self.width * 0.65), screen_w * 0.78))
+        height = int(screen_h * 0.68)
+        window.geometry(f"{width}x{height}+{(screen_w - width) // 2}"
+                        f"+{max(int(36 * self.k), (screen_h - height) // 2)}")
+        window.minsize(min(width, int(540 * self.k)), int(300 * self.k))
 
-        bar = tk.Frame(window, bg=TOOLBAR_BG)
-        bar.pack(fill="x")
-        title = tk.Label(bar, text="本次转录", font=self.small_font, fg=FG_SOURCE,
-                         bg=TOOLBAR_BG)
-        title.pack(side="left", padx=(int(14 * self.k), 0), pady=int(7 * self.k))
+        bar = tk.Frame(window, bg=self.palette.HEADERBAR, height=int(44 * self.k))
+        bar.pack(fill="x", padx=int(24 * self.k))
+        bar.pack_propagate(False)
+        title = tk.Label(bar, text="转录记录", font=self.heading_font,
+                         fg=self.palette.TEXT, bg=self.palette.HEADERBAR, bd=0, anchor="w")
+        title.pack(side="left")
 
         def start_drag(event):
             self._hist_drag = (event.x_root, event.y_root,
@@ -426,29 +542,61 @@ class SubtitleOverlay:
             widget.bind("<Button-1>", start_drag)
             widget.bind("<B1-Motion>", do_drag)
 
-        close = tk.Label(bar, text="✕", font=self.small_font, fg=FG_MUTED,
-                         bg=TOOLBAR_BG, cursor="hand2",
-                         padx=int(12 * self.k), pady=int(4 * self.k))
-        close.pack(side="right", padx=(0, int(8 * self.k)))
-        close.bind("<Button-1>", lambda _e: window.withdraw())
-        close.bind("<Enter>", lambda _e: close.configure(fg=FG_SOURCE))
-        close.bind("<Leave>", lambda _e: close.configure(fg=FG_MUTED))
+        close = tk.Button(
+            bar, text="关闭", command=window.withdraw, font=self.small_font,
+            fg=self.palette.TEXT_DIM, bg=self.palette.HEADERBAR, activebackground=self.palette.HOVER,
+            activeforeground=self.palette.TEXT, cursor="hand2", relief="flat", bd=0,
+            highlightthickness=1, highlightbackground=self.palette.HEADERBAR,
+            highlightcolor=self.palette.ACCENT, padx=int(10 * self.k), pady=int(3 * self.k),
+        )
+        close.pack(side="right")
+        close.bind("<Enter>", lambda _e: close.configure(bg=self.palette.HOVER))
+        close.bind("<Leave>", lambda _e: close.configure(bg=self.palette.HEADERBAR))
+        tk.Frame(window, bg=self.palette.SEPARATOR, height=1).pack(fill="x")
 
+        meta = tk.Frame(window, bg=self.palette.WINDOW)
+        meta.pack(fill="x")
+        self._history_count = tk.Label(
+            meta, text="暂无转录 · 选中文字可复制", font=self.caption_font,
+            fg=self.palette.TEXT_DIM, bg=self.palette.WINDOW, bd=0,
+        )
+        self._history_count.pack(side="left", padx=int(24 * self.k), pady=int(8 * self.k))
         self._status_pill = tk.Label(
-            bar, text="", font=self.small_font, fg=FG_MUTED, bg=TOOLBAR_BG)
-        self._status_pill.pack(side="right", padx=int(10 * self.k))
+            meta, text="跟随最新", font=self.caption_font,
+            fg=self.palette.TEXT_DIM, bg=self.palette.WINDOW, bd=0,
+        )
+        self._status_pill.pack(side="right", padx=int(24 * self.k))
 
-        frame = tk.Frame(window, bg=BG)
-        frame.pack(fill="both", expand=True)
-        scrollbar = tk.Scrollbar(frame, bg=TOOLBAR_BG, troughcolor=BG, bd=0,
-                                 highlightthickness=0)
-        scrollbar.pack(side="right", fill="y")
+        frame = tk.Frame(window, bg=self.palette.WINDOW)
+        frame.pack(fill="both", expand=True, pady=(0, int(14 * self.k)))
+        scrollbar = tk.Scrollbar(
+            frame, bg=self.palette.SURFACE, troughcolor=self.palette.WINDOW,
+            activebackground=self.palette.HOVER,
+            bd=0, highlightthickness=0, relief="flat", elementborderwidth=0,
+            width=int(10 * self.k),
+        )
+        scrollbar.pack(side="right", fill="y", padx=(0, int(5 * self.k)),
+                       pady=int(12 * self.k))
         text = tk.Text(
-            frame, bg=BG, fg=FG_SOURCE, font=self.history_font, wrap="word",
-            bd=0, highlightthickness=0, padx=int(16 * self.k),
-            pady=int(12 * self.k),
+            frame, bg=self.palette.WINDOW, fg=self.palette.TEXT_DIM, font=self.history_font, wrap="word",
+            bd=0, highlightthickness=0, padx=int(24 * self.k),
+            pady=int(8 * self.k), selectbackground=self.palette.ACCENT,
+            selectforeground=self.palette.ACCENT_TEXT, inactiveselectbackground=self.palette.HOVER,
+            insertbackground=self.palette.ACCENT, state="disabled",
         )
         text.pack(side="left", fill="both", expand=True)
+
+        self._history_empty = tk.Frame(frame, bg=self.palette.WINDOW)
+        tk.Label(
+            self._history_empty, text="还没有转录内容", font=self.heading_font,
+            fg=self.palette.TEXT, bg=self.palette.WINDOW, bd=0,
+        ).pack()
+        tk.Label(
+            self._history_empty, text="听到语音后，英文原文和中文翻译会自动出现在这里。",
+            font=self.small_font, fg=self.palette.TEXT_DIM, bg=self.palette.WINDOW, bd=0,
+            wraplength=width - int(100 * self.k),
+        ).pack(pady=(int(10 * self.k), 0))
+        self._history_empty.place(relx=0.5, rely=0.42, anchor="center")
 
         # Every route that can move the view goes through _on_scroll, so the
         # frozen/following state is decided in one place.
@@ -466,18 +614,20 @@ class SubtitleOverlay:
             text.bind(sequence, lambda _e: self.root.after_idle(self._on_scroll),
                       add="+")
 
-        text.tag_configure("time", foreground=FG_MUTED)
-        text.tag_configure("en", foreground=FG_SOURCE, spacing1=int(6 * self.k))
-        text.tag_configure("zh_final", foreground=FG_TARGET, spacing3=int(8 * self.k))
-        text.tag_configure("zh_draft", foreground=FG_PENDING, spacing3=int(8 * self.k))
+        text.tag_configure("time", foreground=self.palette.TEXT_DIM, font=self.caption_font,
+                           spacing1=int(18 * self.k), spacing3=int(4 * self.k))
+        text.tag_configure("en", foreground=self.palette.TEXT_DIM, spacing3=int(4 * self.k))
+        text.tag_configure("zh_final", foreground=self.palette.TEXT, font=self.history_target_font)
+        text.tag_configure("zh_draft", foreground=self.palette.TEXT, font=self.history_target_font)
 
-        # Floating "jump to latest", the way a chat app does it.
         self._jump_button = tk.Button(
-            window, text="↓ 跳到最新", font=self.small_font, command=self._jump_to_latest,
-            fg="#ffffff", bg="#e95420", activebackground="#f06d42",
-            activeforeground="#ffffff", relief="flat", bd=0,
-            padx=int(14 * self.k), pady=int(6 * self.k),
-            highlightthickness=0, cursor="hand2")
+            window, text="回到最新", font=self.small_font, command=self._jump_to_latest,
+            fg=self.palette.ACCENT_TEXT, bg=self.palette.ACCENT,
+            activebackground=self.palette.ACCENT_HOVER,
+            activeforeground=self.palette.ACCENT_TEXT, relief="flat", bd=0,
+            padx=int(16 * self.k), pady=int(7 * self.k),
+            highlightthickness=1, highlightbackground=self.palette.ACCENT,
+            highlightcolor=self.palette.TEXT, cursor="hand2")
 
         self._history_window = window
         self._history_text = text
@@ -524,15 +674,15 @@ class SubtitleOverlay:
         if self._status_pill is None or not self._status_pill.winfo_exists():
             return
         if frozen:
-            label = f"已暂停 · {self._pending} 条新内容" if self._pending else "已暂停"
-            self._status_pill.configure(text=label, fg=FG_TARGET)
+            label = f"正在回看 · {self._pending} 段新内容" if self._pending else "正在回看"
+            self._status_pill.configure(text=label, fg=self.palette.TEXT_DIM)
             self._jump_button.place(relx=0.5, rely=1.0, anchor="s",
                                     y=-int(18 * self.k))
             # A placed widget does not automatically sit above its packed
             # siblings; without this the button is mapped but never painted.
             self._jump_button.lift()
         else:
-            self._status_pill.configure(text="跟随最新", fg=FG_MUTED)
+            self._status_pill.configure(text="跟随最新", fg=self.palette.TEXT_DIM)
             self._jump_button.place_forget()
 
     def _jump_to_latest(self) -> None:
@@ -559,6 +709,15 @@ class SubtitleOverlay:
 
         signatures = [(line.text, line.translation, line.refined)
                       for line in self.history]
+        if self._history_count is not None:
+            count = f"{len(signatures)} 段转录" if signatures else "暂无转录"
+            self._history_count.configure(
+                text=f"{count} · 选中文字可复制")
+        if self._history_empty is not None:
+            if signatures:
+                self._history_empty.place_forget()
+            else:
+                self._history_empty.place(relx=0.5, rely=0.42, anchor="center")
         if signatures == self._rendered:
             return
 
@@ -570,7 +729,9 @@ class SubtitleOverlay:
         # Refinement can rewrite a line that is already on screen, so redraw
         # from the first block that actually differs rather than assuming only
         # the tail changed.
-        first_changed = len(self._rendered)
+        # A snapshot can also retract its tail; keeping the old block count
+        # would leave removed sentences visible in an otherwise current view.
+        first_changed = min(len(self._rendered), len(signatures))
         for index, signature in enumerate(signatures):
             if index >= len(self._rendered) or self._rendered[index] != signature:
                 first_changed = index
@@ -588,7 +749,8 @@ class SubtitleOverlay:
             line = self.history[index]
             text.mark_set(f"block{index}", "end-1c")
             text.mark_gravity(f"block{index}", "left")
-            text.insert("end", f"{line.start}\n", "time")
+            state = "已润色" if line.refined else "实时转录"
+            text.insert("end", f"{line.start}  ·  {state}\n", "time")
             text.insert("end", f"{line.text.strip()}\n", "en")
             if line.translation.strip():
                 text.insert("end", f"{line.translation.strip()}\n",
@@ -618,7 +780,7 @@ class SubtitleOverlay:
         wanted = self.root.winfo_reqheight()
         # Last-ditch guard: whatever the text does, the bar must not grow past
         # what the screen can show, or its bottom rows are simply invisible.
-        wanted = min(wanted, int(self.root.winfo_screenheight() * 0.5))
+        wanted = min(wanted, self.root.winfo_screenheight() - int(24 * self.k))
         current = self.root.winfo_height()
         if wanted == current:
             return
@@ -631,9 +793,10 @@ class SubtitleOverlay:
             return
         elapsed = int(time.monotonic() - self.started_at)
         self.timer_label.configure(text=f"{elapsed // 60:02d}:{elapsed % 60:02d}")
-        colour = {"connected": "#5ad18f", "finished": FG_MUTED}.get(self.status_text, "#e0a458")
+        colour = {"connected": self.palette.SUCCESS,
+                  "finished": self.palette.TEXT_MUTED}.get(self.status_text, self.palette.WARNING)
         label = {"connected": "录制中", "finished": "已结束"}.get(self.status_text, self.status_text)
-        self.status_label.configure(text=f"● {label}", fg=colour)
+        self.status_label.configure(text=label, fg=colour)
         self.root.after(1000, self._tick)
 
     def close(self) -> None:

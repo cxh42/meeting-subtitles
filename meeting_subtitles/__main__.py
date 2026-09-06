@@ -81,6 +81,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--font-size", type=int, default=19, help="字幕字号")
     parser.add_argument("--width-ratio", type=float, default=0.78, help="字幕窗宽度占屏幕比例")
     parser.add_argument("--opacity", type=float, default=0.94, help="字幕窗不透明度 0-1")
+    parser.add_argument("--theme", choices=("light", "dark"), default=None,
+                        help="界面外观：light 浅色、dark 深色（默认沿用上次选择）")
 
     parser.add_argument("--list-devices", action="store_true", help="列出可用音频源后退出")
     parser.add_argument("--log-level", default="INFO",
@@ -297,6 +299,7 @@ def main(argv=None) -> int:
     if not args.no_overlay:
         try:
             overlay = SubtitleOverlay(
+                theme=args.theme,
                 on_close=runner.request_stop,
                 font_size=args.font_size,
                 width_ratio=args.width_ratio,

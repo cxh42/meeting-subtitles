@@ -8,7 +8,6 @@ link to the transcript.
     .venv/bin/python -m meeting_subtitles.launcher
 """
 
-import json
 import logging
 import pathlib
 import socket
@@ -24,11 +23,11 @@ from meeting_subtitles import domain as domains
 from meeting_subtitles import gnome, paths
 from meeting_subtitles.envfix import normalize_proxy_env
 from meeting_subtitles.rounded import RoundedWindow, undecorate
+from meeting_subtitles.settings import CONFIG_PATH, Settings
 from meeting_subtitles.tkfix import child_environment, ensure_cjk_tk
 
 logger = logging.getLogger(__name__)
 
-CONFIG_PATH = paths.settings_path()
 SERVER_LOG = paths.server_log()
 
 HEALTH_URL = "http://127.0.0.1:8000/health"
@@ -170,51 +169,20 @@ def last_error_line(limit: int = 400) -> str:
     return ""
 
 
-class Settings:
-    """Last-used launcher options, persisted between runs."""
-
-    DEFAULTS = {
-        "title": "",
-        "record_mic": True,
-        "refine": True,
-        "domain": "cs-ai",
-        "font_size": 20,
-        "opacity": 94,
-        "output_dir": str(paths.default_output_dir()),
-    }
-
-    def __init__(self) -> None:
-        self.data = dict(self.DEFAULTS)
-        try:
-            self.data.update(json.loads(CONFIG_PATH.read_text(encoding="utf-8")))
-        except (OSError, json.JSONDecodeError):
-            pass
-
-    def save(self) -> None:
-        try:
-            CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-            # Only known keys: a setting that is dropped from the UI would
-            # otherwise stay in the file forever, looking like it still does
-            # something.
-            kept = {k: v for k, v in self.data.items() if k in self.DEFAULTS}
-            CONFIG_PATH.write_text(
-                json.dumps(kept, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-        except OSError as exc:
-            logger.warning("无法保存设置: %s", exc)
-
-    def __getitem__(self, key):
-        return self.data.get(key, self.DEFAULTS.get(key))
-
-    def __setitem__(self, key, value):
-        self.data[key] = value
-
 
 class LauncherApp:
     """The launcher window and the processes it supervises."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, preview: bool = False, theme: str | None = None) -> None:
+        # Screenshots exercise the real widgets without launching the engine.
+        self._preview_mode = preview
+        self._preview_window = None
+        self._preview_canvas = None
+        self._preview_rounded = None
         self.settings = Settings()
+        self.theme = theme if theme in ("light", "dark") else self.settings["theme"]
+        self.settings["theme"] = self.theme
+        self.colors = gnome.get_palette(self.theme)
         self.server_process: subprocess.Popen | None = None
         self.meeting_process: subprocess.Popen | None = None
         self.session_dir: Path | None = None
@@ -246,9 +214,11 @@ class LauncherApp:
         undecorate(self.root)
         self.root.update_idletasks()
         self._rounded = RoundedWindow(self.root, radius=int(14 * self.k))
-        self.root.after(150, self._round_frame)
+        self._round_job = self.root.after(150, self._round_frame)
         self.root.protocol("WM_DELETE_WINDOW", self._on_window_close)
-        self.root.after(200, self._poll)
+        self._poll_job = None
+        if not self._preview_mode:
+            self._poll_job = self.root.after(200, self._poll)
 
     # ---------------------------------------------------------------- layout
 
@@ -258,147 +228,254 @@ class LauncherApp:
     def _px(self, value: float) -> int:
         return int(value * self.k)
 
-    def _f(self, size: int, weight: str = "normal") -> tuple:
-        return (self.font_family, size, weight)
-
-    def _px(self, value: float) -> int:
-        return int(value * self.k)
-
     def _build_ui(self) -> None:
-        """A header bar and three boxed lists, the way GNOME Settings is built.
+        """A compact meeting form; display samples appear where captions run."""
+        G, C = gnome, self.colors
+        self.root.configure(bg=C.WINDOW)
+        self.root.option_add("*selectBackground", C.ACCENT)
+        self.root.option_add("*selectForeground", C.ACCENT_TEXT)
 
-        Deliberately no tagline or feature blurb: a tool the user opens every
-        day should show its controls, not describe itself.
-        """
-        G = gnome
-        self.root.configure(bg=G.WINDOW)
-
-        # We drop the WM title bar to get all four corners rounded, so the
-        # window needs its own -- which is also what GNOME's own apps do.
-        header = tk.Frame(self.root, bg=G.HEADERBAR, height=self._px(44))
-        header.pack(fill="x", side="top")
+        header = tk.Frame(self.root, bg=C.HEADERBAR, height=self._px(48))
+        header.pack(fill="x")
         header.pack_propagate(False)
-        tk.Label(header, text="会议字幕", font=self._f(11, "bold"),
-                 fg=G.TEXT, bg=G.HEADERBAR).place(relx=0.5, rely=0.5, anchor="center")
-        close = tk.Label(header, text="✕", font=self._f(11), fg=G.TEXT_DIM,
-                         bg=G.HEADERBAR, cursor="hand2",
-                         padx=self._px(12), pady=self._px(6))
-        close.pack(side="right", padx=(0, self._px(8)))
-        close.bind("<Button-1>", lambda _e: self._on_window_close())
-        close.bind("<Enter>", lambda _e: close.configure(fg=G.TEXT))
-        close.bind("<Leave>", lambda _e: close.configure(fg=G.TEXT_DIM))
-        for widget in (header,):
+        title = tk.Label(header, text="会议字幕", font=self._f(13, "bold"),
+                         fg=C.TEXT, bg=C.HEADERBAR)
+        title.pack(side="left", padx=self._px(24))
+        G.Button(header, "", self._on_window_close, icon="close", flat=True,
+                 width=32, height=32, scale=self.k, palette=C, parent_bg=C.HEADERBAR).pack(
+                     side="right", padx=(self._px(4), self._px(12)))
+        G.Button(header, "", self.root.iconify, icon="minimize", flat=True,
+                 width=32, height=32, scale=self.k, palette=C, parent_bg=C.HEADERBAR).pack(side="right")
+        self.theme_button = G.Button(
+            header, "切换深色" if self.theme == "light" else "切换浅色",
+            self._toggle_theme, flat=True, width=88, height=30,
+            scale=self.k, palette=C, parent_bg=C.HEADERBAR, font=self._f(9))
+        self.theme_button.pack(side="right", padx=(0, self._px(12)))
+        for widget in (header, title):
             widget.bind("<Button-1>", self._drag_start)
             widget.bind("<B1-Motion>", self._drag_move)
+        tk.Frame(self.root, bg=C.SEPARATOR, height=1).pack(fill="x")
 
-        body = tk.Frame(self.root, bg=G.WINDOW)
-        body.pack(fill="both", expand=True,
-                  padx=self._px(20), pady=(self._px(20), self._px(20)))
-        W = 340
+        icon_path = Path(__file__).parent / "assets" / "meeting-subtitles-256.png"
+        try:
+            self._app_icon = tk.PhotoImage(file=str(icon_path))
+            self.root.iconphoto(True, self._app_icon)
+        except tk.TclError:
+            pass
 
-        # --- status ---------------------------------------------------------
-        status_box = G.BoxedList(body, width=W, scale=self.k, parent_bg=G.WINDOW)
-        row = status_box.add_row(50)
-        self._status_dot = tk.Canvas(row, width=self._px(10), height=self._px(10),
-                                     bg=G.CARD, highlightthickness=0, bd=0)
-        self._dot = self._status_dot.create_oval(
-            0, 0, self._px(9), self._px(9), fill=G.WARNING, outline="")
-        self._status_dot.pack(side="left", padx=(self._px(16), self._px(10)))
-        self.status_label = tk.Label(row, text="正在检查转录引擎", anchor="w",
-                                     font=self._f(11), fg=G.TEXT, bg=G.CARD)
-        self.status_label.pack(side="left", fill="x", expand=True)
-        self.engine_button = G.Button(
-            row, "关闭引擎", self._toggle_engine, width=88, height=30,
-            scale=self.k, parent_bg=G.CARD, font=self._f(9))
-        self.engine_button.pack(side="right", padx=(0, self._px(12)))
-        status_box.render()
-        status_box.pack(anchor="w", pady=(0, self._px(6)))
-        # Always present, painted in the window colour when stopped, so
-        # starting and stopping it never reflows the window.
-        self.progress = G.IndeterminateBar(body, width=W, scale=self.k,
-                                           parent_bg=G.WINDOW)
-        self.progress.pack(anchor="w", pady=(0, self._px(12)))
-
-        # --- text fields ----------------------------------------------------
-        fields = G.BoxedList(body, width=W, scale=self.k, parent_bg=G.WINDOW)
-        row = fields.add_row(56)
-        tk.Label(row, text="会议名称", font=self._f(11), fg=G.TEXT,
-                 bg=G.CARD).pack(side="left", padx=(self._px(16), 0))
-        self.title_entry = G.Entry(row, placeholder="可留空", width=170,
-                                   scale=self.k, font=self._f(10), parent_bg=G.CARD)
-        self.title_entry.pack(side="right", padx=(0, self._px(12)))
+        width = 552
+        body = tk.Frame(self.root, bg=C.WINDOW, width=self._px(width))
+        body.pack(fill="both", expand=True, padx=self._px(24),
+                  pady=(self._px(20), self._px(16)))
+        name = tk.Frame(body, bg=C.WINDOW, height=self._px(42))
+        name.pack(fill="x")
+        name.pack_propagate(False)
+        tk.Label(name, text="会议名称", font=self._f(11), fg=C.TEXT,
+                 bg=C.WINDOW).pack(side="left")
+        self.title_entry = G.Entry(
+            name, placeholder="可留空，按日期保存", width=438,
+            scale=self.k, palette=C, font=self._f(11), parent_bg=C.WINDOW)
+        self.title_entry.pack(side="right")
         self.title_entry.set(self.settings["title"])
 
-        fields.render()
-        fields.pack(anchor="w", pady=(0, self._px(18)))
-
-        # --- switches -------------------------------------------------------
-        options = G.BoxedList(body, width=W, scale=self.k, parent_bg=G.WINDOW)
+        options = tk.Frame(body, bg=C.WINDOW)
+        options.pack(fill="x", pady=(self._px(18), self._px(14)))
 
         def switch_row(label: str, subtitle: str, value: bool) -> G.Switch:
-            row = options.add_row(58 if subtitle else 50)
-            text = tk.Frame(row, bg=G.CARD)
-            text.pack(side="left", fill="both", expand=True,
-                      padx=(self._px(16), 0))
-            tk.Label(text, text=label, font=self._f(11), fg=G.TEXT, bg=G.CARD,
-                     anchor="w").pack(fill="x", pady=(self._px(9) if subtitle else 0, 0))
-            if subtitle:
-                tk.Label(text, text=subtitle, font=self._f(8), fg=G.TEXT_DIM,
-                         bg=G.CARD, anchor="w").pack(fill="x")
-            switch = G.Switch(row, value=value, scale=self.k, parent_bg=G.CARD)
-            switch.pack(side="right", padx=(0, self._px(14)))
+            if options.winfo_children():
+                tk.Frame(options, bg=C.SEPARATOR, height=1).pack(fill="x")
+            row = tk.Frame(options, bg=C.WINDOW, height=self._px(62))
+            row.pack(fill="x")
+            row.pack_propagate(False)
+            switch = G.Switch(row, value=value, scale=self.k, palette=C, parent_bg=C.WINDOW)
+            switch.pack(side="right")
+            labels = tk.Frame(row, bg=C.WINDOW)
+            labels.pack(side="left", fill="x", expand=True)
+            tk.Label(labels, text=label, font=self._f(11), fg=C.TEXT,
+                     bg=C.WINDOW, anchor="w").pack(anchor="w")
+            tk.Label(labels, text=subtitle, font=self._f(9), fg=C.TEXT_DIM,
+                     bg=C.WINDOW, anchor="w").pack(anchor="w", pady=(self._px(2), 0))
             return switch
 
-        self.mic_toggle = switch_row("录制麦克风", "把你说的话也计入转录",
+        self.mic_toggle = switch_row("录制麦克风", "关闭后只转录电脑播放的声音",
                                      bool(self.settings["record_mic"]))
-        self.refine_toggle = switch_row("整句润色", "说完一句后重新翻译，占用约 8 GB 显存",
+        self.refine_toggle = switch_row("整句润色", "句子说完后，优化中文译文",
                                         bool(self.settings["refine"]))
         self.domain_toggle = switch_row(
-            "CS / AI 术语", f"内置 {len(domains.get('cs-ai').terms)} 个领域词",
+            "计算机与 AI 术语", f"内置 {len(domains.get('cs-ai').terms)} 个领域词",
             self.settings["domain"] == "cs-ai")
 
-        row = options.add_row(50)
-        tk.Label(row, text="字幕大小", font=self._f(11), fg=G.TEXT,
-                 bg=G.CARD).pack(side="left", padx=(self._px(16), 0))
-        self.font_slider = G.Slider(
-            row, minimum=14, maximum=34, value=int(self.settings["font_size"]),
-            width=175, scale=self.k, font=self._f(9), parent_bg=G.CARD)
-        self.font_slider.pack(side="right", padx=(0, self._px(12)))
+        appearance_heading = tk.Frame(body, bg=C.WINDOW)
+        appearance_heading.pack(fill="x", pady=(self._px(2), self._px(4)))
+        tk.Label(appearance_heading, text="字幕显示", font=self._f(11, "bold"),
+                 fg=C.TEXT, bg=C.WINDOW).pack(side="left")
+        self.preview_button = G.Button(
+            appearance_heading, "预览字幕", self._show_preview, flat=True,
+            width=90, height=32, scale=self.k, palette=C, parent_bg=C.WINDOW, font=self._f(10))
+        self.preview_button.pack(side="right")
 
-        row = options.add_row(50)
-        tk.Label(row, text="字幕透明度", font=self._f(11), fg=G.TEXT,
-                 bg=G.CARD).pack(side="left", padx=(self._px(16), 0))
-        # Percent rather than the 0-1 the overlay takes: a slider reading
-        # "0.94" invites nudging it to 0.9 and wondering why nothing moved.
-        self.opacity_slider = G.Slider(
-            row, minimum=40, maximum=100, value=int(self.settings["opacity"]),
-            width=175, scale=self.k, font=self._f(9), parent_bg=G.CARD,
-            suffix="%")
-        self.opacity_slider.pack(side="right", padx=(0, self._px(12)))
-        options.render()
-        options.pack(anchor="w", pady=(0, self._px(22)))
+        for label, attribute, minimum, maximum, key, suffix in (
+            ("字号", "font_slider", 14, 34, "font_size", ""),
+            ("不透明度", "opacity_slider", 40, 100, "opacity", "%"),
+        ):
+            row = tk.Frame(body, bg=C.WINDOW, height=self._px(42))
+            row.pack(fill="x")
+            row.pack_propagate(False)
+            tk.Label(row, text=label, font=self._f(11), fg=C.TEXT,
+                     bg=C.WINDOW).pack(side="left")
+            slider = G.Slider(
+                row, minimum=minimum, maximum=maximum, value=int(self.settings[key]),
+                width=330, scale=self.k, palette=C, font=self._f(10), parent_bg=C.WINDOW,
+                suffix=suffix, on_change=lambda _value: self._update_preview())
+            slider.pack(side="right")
+            setattr(self, attribute, slider)
 
-        # --- primary action -------------------------------------------------
+        tk.Frame(body, bg=C.SEPARATOR, height=1).pack(
+            fill="x", pady=(self._px(16), self._px(10)))
+        engine = tk.Frame(body, bg=C.WINDOW, height=self._px(34))
+        engine.pack(fill="x")
+        engine.pack_propagate(False)
+        self._status_dot = tk.Canvas(engine, width=self._px(7), height=self._px(7),
+                                     bg=C.WINDOW, highlightthickness=0, bd=0)
+        self._dot = self._status_dot.create_oval(
+            0, 0, self._px(6), self._px(6), fill=C.WARNING, outline="")
+        self._status_dot.pack(side="left", padx=(0, self._px(8)))
+        self.engine_button = G.Button(
+            engine, "关闭引擎", self._toggle_engine, flat=True, width=86, height=30,
+            scale=self.k, palette=C, parent_bg=C.WINDOW, font=self._f(9))
+        self.engine_button.pack(side="right")
+        self.status_label = tk.Label(
+            engine, text="正在检查转录引擎", anchor="w", justify="left",
+            font=self._f(10), fg=C.TEXT_DIM, bg=C.WINDOW)
+        self.status_label.pack(side="left", fill="x", expand=True)
+
+        self.progress = G.IndeterminateBar(body, width=width, scale=self.k, palette=C,
+                                           parent_bg=C.WINDOW)
+        self.progress.pack(fill="x", pady=(self._px(3), self._px(8)))
+        actions = tk.Frame(body, bg=C.WINDOW)
+        actions.pack(fill="x")
+        self.folder_button = G.Button(
+            actions, "打开会议记录", self._open_folder, flat=True,
+            width=122, height=40, scale=self.k, palette=C, parent_bg=C.WINDOW, font=self._f(10))
+        self.folder_button.pack(side="left")
         self.start_button = G.Button(
-            body, "开始会议", self._on_start, width=W, height=44, scale=self.k,
-            accent=True, parent_bg=G.WINDOW, font=self._f(12, "bold"))
-        self.start_button.pack(anchor="w")
+            actions, "开始会议", self._on_start, width=132, height=40,
+            scale=self.k, palette=C, accent=True, parent_bg=C.WINDOW, font=self._f(11, "bold"))
+        self.start_button.pack(side="right")
         self.start_button.set_enabled(False)
 
-        footer = tk.Frame(body, bg=G.WINDOW)
-        footer.pack(fill="x", pady=(self._px(12), 0))
-        self.folder_button = G.Button(
-            footer, "打开转录文件夹", self._open_folder, width=W, height=34,
-            scale=self.k, parent_bg=G.WINDOW, font=self._f(10))
-        self.folder_button.pack(anchor="w")
+        self.hint = tk.Label(body, text="", font=self._f(9), fg=C.TEXT_DIM,
+                             bg=C.WINDOW, wraplength=self._px(width),
+                             justify="left", height=2, anchor="nw")
+        self.hint.pack(fill="x", pady=(self._px(8), 0))
 
-        # Two lines are reserved whatever the text says: a label that grows
-        # and shrinks resizes the whole window under the user's cursor, and
-        # the rounded mask has to chase it.
-        self.hint = tk.Label(body, text="", font=self._f(8), fg=G.TEXT_DIM,
-                             bg=G.WINDOW, wraplength=self._px(W), justify="left",
-                             height=2, anchor="nw")
-        self.hint.pack(anchor="w", pady=(self._px(10), 0))
+    def _toggle_theme(self) -> None:
+        self._set_theme("dark" if self.theme == "light" else "light")
+
+    def _set_theme(self, theme: str) -> None:
+        if theme not in ("light", "dark") or theme == self.theme:
+            return
+        self._remember_options()
+        status = self.status_label.cget("text")
+        dot = self._status_dot.itemcget(self._dot, "fill")
+        status_role = next((role for role in ("SUCCESS", "WARNING", "ERROR", "TEXT_MUTED")
+                            if getattr(self.colors, role) == dot), "TEXT_MUTED")
+        hint = self.hint.cget("text")
+        engine_text = self.engine_button.itemcget(self.engine_button._label, "text")
+        start_enabled = self.start_button._enabled
+        loading = self.progress._job is not None
+        preview_open = self._preview_window is not None
+        self.progress.stop()
+        self._close_preview()
+        self.theme = theme
+        self.settings["theme"] = theme
+        self.colors = gnome.get_palette(theme)
+        # Rebuild only the controls: the root, process handles and health-check
+        # callbacks survive, so changing appearance cannot restart a meeting.
+        for child in self.root.winfo_children():
+            child.destroy()
+        self._build_ui()
+        self._set_status(status, getattr(self.colors, status_role))
+        self._set_hint(hint)
+        self.start_button.set_enabled(start_enabled)
+        self.engine_button.set_text(engine_text)
+        if loading:
+            self.progress.start()
+        self.root.update_idletasks()
+        self._rounded.apply_current()
+        self.theme_button.focus_set()
+        if preview_open:
+            self._show_preview()
+        if not self._preview_mode and not self.settings.save():
+            self._set_hint(f"外观已切换，但未能记住。请检查配置目录的写入权限：\n{CONFIG_PATH.parent}")
+
+    def _show_preview(self) -> None:
+        if self._preview_window is not None and self._preview_window.winfo_exists():
+            self._preview_window.lift()
+            return
+        C = self.colors
+        window = tk.Toplevel(self.root)
+        window.title("字幕预览")
+        window.overrideredirect(True)
+        window.attributes("-topmost", True)
+        window.configure(bg=C.WINDOW)
+        self._preview_window = window
+        bar = tk.Frame(window, bg=C.WINDOW)
+        bar.pack(fill="x", padx=self._px(20), pady=(self._px(6), 0))
+        tk.Label(bar, text="字幕预览 · 示例内容", font=self._f(9),
+                 fg=C.TEXT_DIM, bg=C.WINDOW).pack(side="left")
+        tk.Button(bar, text="关闭预览", command=self._close_preview,
+                  font=self._f(9), bg=C.WINDOW, fg=C.TEXT,
+                  activebackground=C.HOVER, activeforeground=C.TEXT,
+                  bd=0, relief="flat", highlightthickness=1,
+                  highlightbackground=C.WINDOW, highlightcolor=C.TEXT_DIM,
+                  padx=self._px(10), pady=self._px(4), cursor="hand2").pack(side="right")
+        self._preview_width = min(self._px(960), self.root.winfo_screenwidth() - self._px(48))
+        canvas = tk.Canvas(window, width=self._preview_width, bg=C.WINDOW,
+                           bd=0, highlightthickness=0)
+        canvas.pack(fill="both", expand=True)
+        self._preview_canvas = canvas
+        self._preview_target = canvas.create_text(
+            self._px(24), self._px(6), anchor="nw", text="我们先看一下上周的结果。",
+            width=self._preview_width - self._px(48), fill=C.TEXT)
+        self._preview_source = canvas.create_text(
+            self._px(24), 0, anchor="nw", text="Let's review the results from last week.",
+            width=self._preview_width - self._px(48), fill=C.TEXT_DIM)
+        window.bind("<Escape>", lambda _e: self._close_preview())
+        window.bind("<Map>", lambda _e: self._update_preview())
+        self._update_preview()
+        window.update_idletasks()
+        self._preview_rounded = RoundedWindow(window, radius=self._px(12))
+        self._preview_rounded.apply_current()
+        window.bind("<Configure>", lambda event: self._preview_rounded.apply_current()
+                    if event.widget is window and self._preview_rounded is not None else None)
+
+    def _close_preview(self) -> None:
+        if self._preview_rounded is not None:
+            self._preview_rounded.close()
+            self._preview_rounded = None
+        if self._preview_window is not None:
+            self._preview_window.destroy()
+            self._preview_window = None
+        self._preview_canvas = None
+
+    def _update_preview(self) -> None:
+        canvas = self._preview_canvas
+        if canvas is None or not canvas.winfo_exists():
+            return
+        size = self.font_slider.get()
+        canvas.itemconfigure(self._preview_target, font=self._f(size))
+        canvas.itemconfigure(self._preview_source, font=self._f(max(11, size - 3)))
+        target_bottom = canvas.bbox(self._preview_target)[3]
+        canvas.coords(self._preview_source, self._px(24), target_bottom + self._px(4))
+        canvas.configure(height=canvas.bbox(self._preview_source)[3] + self._px(18))
+        window = self._preview_window
+        window.attributes("-alpha", self.opacity_slider.get() / 100)
+        window.update_idletasks()
+        height = window.winfo_reqheight()
+        x = (self.root.winfo_screenwidth() - self._preview_width) // 2
+        y = max(0, self.root.winfo_screenheight() - height - self._px(64))
+        window.geometry(f"{self._preview_width}x{height}+{x}+{y}")
 
     def _drag_start(self, event) -> None:
         self._drag_origin = (event.x_root, event.y_root)
@@ -472,7 +549,7 @@ class LauncherApp:
                 env=child_environment(), start_new_session=True,
             )
         except OSError as exc:
-            self._set_status("无法启动转录引擎", gnome.ERROR)
+            self._set_status("无法启动转录引擎", self.colors.ERROR)
             self._set_hint(f"无法启动引擎进程: {exc}")
             self.state = "offline"
             return
@@ -487,12 +564,14 @@ class LauncherApp:
         self.state = "offline"
 
     def _toggle_engine(self) -> None:
+        if self._preview_mode:
+            return
         if self.state == "running":
             self._set_hint("会议进行中，请先结束会议再关闭引擎。")
             return
         if self.state in ("ready", "starting"):
             self._stop_server()
-            self._set_hint("转录引擎已关闭，显存已释放。下次开始会议会自动重新加载。")
+            self._set_hint("转录引擎已关闭，显存已释放。点击「启动引擎」可重新加载。")
         else:
             self._user_stopped = False
             self._set_hint("正在启动转录引擎…")
@@ -500,19 +579,26 @@ class LauncherApp:
 
     # --------------------------------------------------------------- actions
 
-    def _persist(self) -> None:
+    def _remember_options(self) -> None:
         self.settings["title"] = self.title_entry.get()
         self.settings["record_mic"] = self.mic_toggle.value
         self.settings["refine"] = self.refine_toggle.value
         self.settings["domain"] = "cs-ai" if self.domain_toggle.value else "general"
         self.settings["font_size"] = self.font_slider.get()
         self.settings["opacity"] = self.opacity_slider.get()
+
+    def _persist(self) -> None:
+        if self._preview_mode:
+            return
+        self._remember_options()
         self.settings.save()
 
     def _on_start(self) -> None:
-        if self.state != "ready" or self.meeting_process is not None:
+        if self._preview_mode or self.state != "ready" or self.meeting_process is not None:
             return
         self._persist()
+        self._close_preview()
+        self._set_hint("")
 
         title = self.title_entry.get() or "会议记录"
         slug = title.replace("/", "-").replace(" ", "_")
@@ -525,6 +611,7 @@ class LauncherApp:
             "--title", title,
             "--font-size", str(self.font_slider.get()),
             "--opacity", f"{self.opacity_slider.get() / 100:.2f}",
+            "--theme", self.theme,
             "--log-level", "WARNING",
         ]
         if not self.mic_toggle.value:
@@ -557,14 +644,23 @@ class LauncherApp:
     def _open_folder(self) -> None:
         target = self.session_dir if self.session_dir and self.session_dir.exists() \
             else Path(self.settings["output_dir"]).expanduser()
-        paths.open_in_file_manager(target)
+        try:
+            paths.open_in_file_manager(target)
+        except OSError:
+            self._set_hint(f"无法打开会议记录。请检查目录权限，或手动打开：\n{target}")
 
     def _on_window_close(self) -> None:
+        self._close_preview()
         self._persist()
         if self.meeting_process is not None:
             self.meeting_process.terminate()
         # The server deliberately outlives the launcher so the next meeting
         # starts instantly; "关闭引擎" is the way to free the GPU.
+        self.progress.stop()
+        self.root.after_cancel(self._round_job)
+        if self._poll_job is not None:
+            self.root.after_cancel(self._poll_job)
+        self._rounded.close()
         self.root.destroy()
 
     # ------------------------------------------------------------------ loop
@@ -575,12 +671,12 @@ class LauncherApp:
                 self._on_meeting_finished()
             else:
                 self.progress.stop()
-                self._set_status("会议进行中", gnome.SUCCESS)
+                self._set_status("会议进行中", self.colors.SUCCESS)
                 self.start_button.set_enabled(False)
                 self.engine_button.set_text("关闭引擎")
         else:
             threading.Thread(target=self._refresh_state, daemon=True).start()
-        self.root.after(1500, self._poll)
+        self._poll_job = self.root.after(1500, self._poll)
 
     def _refresh_state(self) -> None:
         """Health check off the UI thread; the result is applied back on it.
@@ -609,12 +705,13 @@ class LauncherApp:
             return
 
         if up:
+            if self.state != "ready":
+                self._set_hint("")
             self.state = "ready"
             self.progress.stop()
-            self._set_status("转录引擎已就绪", gnome.SUCCESS)
+            self._set_status("转录引擎已就绪", self.colors.SUCCESS)
             self.start_button.set_enabled(True)
             self.engine_button.set_text("关闭引擎")
-            self._set_hint("")
             return
 
         loading = listening or (
@@ -627,7 +724,7 @@ class LauncherApp:
                 if self._server_wait_started else 0
             stage = engine_stage()
             self._set_status(f"{stage}…（{waited} 秒）" if waited
-                             else f"{stage}…", gnome.WARNING)
+                             else f"{stage}…", self.colors.WARNING)
             self.start_button.set_enabled(False)
             self.engine_button.set_text("关闭引擎")
             self._set_hint(self._loading_detail(waited))
@@ -638,7 +735,7 @@ class LauncherApp:
             self.server_process = None
             self.state = "offline"
             self.progress.stop()
-            self._set_status("转录引擎启动失败", gnome.ERROR)
+            self._set_status("转录引擎启动失败", self.colors.ERROR)
             self.start_button.set_enabled(False)
             self.engine_button.set_text("启动引擎")
             reason = last_error_line()
@@ -649,14 +746,14 @@ class LauncherApp:
             return
 
         if not self._user_stopped:
-            self._set_status("正在启动转录引擎…", gnome.WARNING)
+            self._set_status("正在启动转录引擎…", self.colors.WARNING)
             self.start_button.set_enabled(False)
             self._start_server()
             return
 
         self.state = "offline"
         self.progress.stop()
-        self._set_status("转录引擎未运行", gnome.ERROR)
+        self._set_status("转录引擎已关闭", self.colors.TEXT_MUTED)
         self.start_button.set_enabled(False)
         self.engine_button.set_text("启动引擎")
 

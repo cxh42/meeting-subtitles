@@ -1,205 +1,228 @@
 # Meeting Subtitles
 
-**Real-time English → Chinese subtitles for any meeting, running entirely on your own GPU.**
+**Live English-to-Chinese meeting subtitles, with local transcription and translation.**
 
-[简体中文](README.zh-CN.md) · [Design notes](docs/design-notes.zh-CN.md)
+[简体中文](README.zh-CN.md) · [Design notes (Chinese)](docs/design-notes.zh-CN.md)
 
-A floating bar sits at the bottom of your screen. The top line is the finished
-Chinese translation of the sentence that just ended; below it the English runs
-live, with a rough Chinese draft under that. Nothing is sent anywhere — no API
-keys, no accounts, no network after the models are cached.
+Meeting Subtitles is a Linux desktop tool for following English-language meetings
+and keeping a bilingual transcript. It captures system playback and, optionally,
+your microphone, so it works with meeting apps, browser videos, and local media
+without a separate integration for each app.
 
-![The subtitle bar](docs/images/subtitle-bar.png)
+With the default local engine, audio and text are processed on your computer.
+Models need to be downloaded before offline use; no cloud API account is required.
+The interface is in Simplified Chinese.
 
-Built for a specific situation: you are a non-native English speaker in
-meetings with international colleagues, some with strong accents, and you want
-to follow along *and* keep a transcript. It transcribes English speech and
-translates it to Chinese.
+![Live bilingual subtitles in dark mode](docs/images/dark/subtitle-bar.png)
 
----
+## Features
 
-## Why this instead of the built-in captions
+- **Live captions with sentence refinement.** Read the English source and a Chinese
+  draft as speech arrives. Once a sentence is refined, its completed translation
+  stays at the top while the next sentence develops.
+- **A desktop launcher.** Start from the application menu, choose meeting options,
+  and let the launcher manage the transcription engine.
+- **Light and dark modes.** Change appearance in the title bar. The choice is saved
+  immediately and restored next time, including for captions and transcript history.
+- **A live display preview.** Adjust font size and opacity against a sample caption
+  at the bottom of your screen before recording.
+- **Readable history and local files.** Scroll back without losing your place,
+  select text to copy, and save a Markdown transcript alongside the meeting audio.
+- **Domain terminology.** A built-in CS/AI preset and optional custom terms help
+  the models handle technical vocabulary and names.
 
-|  | Zoom / Teams captions | This |
-|---|---|---|
-| Where the audio goes | a vendor's servers | nowhere |
-| Chinese translation | often unavailable or paid | always, locally |
-| Works with | that one app | anything the machine plays |
-| Transcript | per-vendor, sometimes paywalled | a Markdown file you own |
-| Domain terminology | generic | a glossary you control |
+WhisperLiveKit runs Whisper large-v3 for recognition and NLLB-1.3B for streaming
+translation. A local Qwen3-4B model then refines completed sentences.
 
-Because it captures the audio your **speakers** are playing rather than hooking
-into a specific program, it works with Zoom, Teams, Meet, a browser tab, a
-local video file, or anything else — no plugin and no permission from the app
-producing the sound.
+## Requirements
 
-## How it works
+| Component | Requirement |
+| --- | --- |
+| System | Linux with PulseAudio or PipeWire's PulseAudio compatibility service. Tested on Ubuntu 24.04 with GNOME and XWayland. |
+| GPU | NVIDIA with CUDA support. The default models use roughly 22 GB of VRAM with sentence refinement, or 14 GB without it. These are reference estimates, not fixed requirements. |
+| Storage | Roughly 18–20 GB for the default model cache, plus space for dependencies and meeting recordings. |
+| Python | Python 3.11 or later, with Tk and a CJK font. |
 
-```
-system audio (what the others say) ┐
-                                   ├─ ffmpeg mix → 16 kHz mono PCM
-microphone (what you say)          ┘        │
-                                            ▼
-                       WhisperLiveKit  ── ws://127.0.0.1:8000/asr
-                       Whisper large-v3  →  English text, streamed
-                       NLLB-1.3B         →  Chinese draft, streamed
-                                            │
-                                            ▼
-                       Qwen3-4B  → whole-sentence Chinese, once a sentence ends
-                                            │
-                     ┌──────────────────────┴──────────────────────┐
-                     ▼                                             ▼
-              floating subtitle bar                        transcript.md
-```
+Memory use and latency depend on the models, runtime, hardware, and audio. The
+current sentence-refinement path uses CUDA; a CPU-only setup does not provide
+the full default experience.
 
-**Two-tier translation** is the part that makes it readable. A streaming
-translator has to commit to words before the sentence is over, so it produces
-something word-by-word and awkward. That draft still shows — in grey, so you
-have *something* immediately — but the moment a sentence ends, a local
-instruct model retranslates it whole and pins the result on top in orange.
-Draft latency is around a second; a refined sentence lands 0.1–0.4 s after the
-speaker stops.
-
-## What you need
-
-| | |
-|---|---|
-| OS | Linux with PulseAudio or PipeWire. Tested on Ubuntu 24.04 (GNOME, Wayland via XWayland). |
-| GPU | NVIDIA, **~22 GB VRAM** with sentence refinement on, **~14 GB** with `--no-refine`. |
-| Disk | ~18 GB of models, downloaded once. |
-| Python | 3.11 or newer, with `python3-tk`. |
-
-No GPU, or a small one? It will run on CPU, but not in real time. This is not
-the tool for that.
-
-## Install
+## Installation
 
 ```bash
-git clone https://github.com/cxh42/meeting-subtitles
+git clone https://github.com/cxh42/meeting-subtitles.git
 cd meeting-subtitles
 ./install.sh
 ```
 
-`install.sh` checks the system packages it needs (and prints the one `apt`
-command to run if any are missing), creates a virtualenv, installs everything,
-registers a desktop entry, and finishes by running the environment check.
+The installer checks system dependencies, creates a virtual environment, installs
+the project, adds a desktop entry, and runs diagnostics. If system packages are
+missing, it prints an installation command for you to run before trying again.
 
-Run that check any time — after a system upgrade, or when something stops
-working:
+The engine downloads its Whisper and NLLB models when first started. Sentence
+refinement loads Qwen from the local cache, so download it once before your first
+meeting, or restore an existing model backup:
+
+```bash
+HF_HUB_OFFLINE=0 .venv/bin/python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-4B-Instruct-2507')"
+```
+
+If you do not need refinement, turn off **整句润色** in the launcher and skip the
+Qwen download. Without that model cached, refinement cannot run; streaming
+translation remains available once the engine is ready.
+
+To check the environment after installation or diagnose a problem:
 
 ```bash
 .venv/bin/meeting-subtitles-doctor
 ```
 
-It reports on Python, ffmpeg, the audio server, the monitor source, CUDA,
-fonts, the display server and the model cache separately, so a failure points
-at one thing to fix.
+The report covers audio devices, CUDA libraries, Chinese fonts, the display,
+model caches, and other dependencies, with suggested fixes for failures.
 
-## Use
+## Using the desktop app
 
-![The launcher](docs/images/launcher.png)
-
-Search for **会议字幕 / Meeting Subtitles** in your application list, or run
-`.venv/bin/meeting-subtitles`.
-
-1. Name the meeting; set the subtitle size and opacity to taste.
-2. The engine loads on first use (20–40 s once models are cached). **Start**
-   lights up when it is ready.
-3. The launcher hides, the subtitle bar appears.
-4. Press **结束并保存 / End** on the bar when the meeting is over.
-
-Everything lands in `~/Meetings/<date>_<name>/`: `transcript.md`, written
-atomically every 3 seconds, and `audio.wav` so you can re-transcribe later.
-
-Press **历史 / History** on the bar for the full transcript so far. Scrolling
-up freezes it — new sentences stop pushing the text you are reading — and a
-button appears to jump back to the live end.
-
-![The history window](docs/images/history.png)
-
-### From the command line
+Search for **会议字幕 / Meeting Subtitles** in the application menu, or run:
 
 ```bash
-.venv/bin/meeting-subtitles-engine          # start the engine, keep it running
-.venv/bin/meeting-subtitles-run --help      # one session, without the GUI
+.venv/bin/meeting-subtitles
 ```
 
-Useful options:
+| Light mode | Dark mode |
+| --- | --- |
+| ![Launcher in light mode](docs/images/launcher.png) | ![Launcher in dark mode](docs/images/dark/launcher.png) |
+
+1. Enter a meeting name, or leave it blank to use the default name with a date.
+2. Choose whether to record the microphone, refine completed sentences, and use
+   the built-in CS/AI terminology preset.
+3. Set the font size and opacity. Click **预览字幕** to see a sample at the screen
+   bottom. Use **切换深色 / 切换浅色** in the title bar to change appearance.
+4. Wait for the engine to report that it is ready, then click **开始会议**.
+   The launcher hides and the caption bar appears. First-time downloads and model
+   loading can take several minutes; the launcher shows the current stage.
+5. Click **结束并保存** on the caption bar to finish. The launcher returns with
+   the recording location; **打开会议记录** opens the folder.
+
+![Caption preview in light mode](docs/images/launcher-preview.png)
+
+Meeting options are remembered between sessions. The engine stays running after
+a meeting so it can be reused; **关闭引擎** stops it when you want to release its
+GPU memory.
+
+### Captions and transcript history
+
+The top section shows the most recent refined Chinese sentence. Below it are the
+live English source and Chinese draft. The draft can change as more speech arrives;
+refinement considers the completed sentence. Processing time varies with the audio
+and available hardware.
+
+| Control | Action |
+| --- | --- |
+| **转录记录** | Open the transcript for the current meeting. Select text to copy it. |
+| **原文** | Show or hide the English source. |
+| **暂停显示 / 继续显示** | Pause or resume the caption display. Transcription and recording continue. |
+| **显示设置** | Adjust caption size and opacity during the meeting. |
+| **结束并保存** | End the meeting and finish saving its files. |
+
+When you scroll up in the history window, the view stops following new text.
+Use **回到最新** or scroll to the bottom to resume following it.
+
+![Transcript history in light mode](docs/images/history.png)
+
+By default, each meeting creates a folder under `~/Meetings/<date>_<name>/` with
+`transcript.md` and `audio.wav`. The transcript is saved periodically during the
+meeting and finalized when the session ends. Command-line options also support
+SRT and JSON output.
+
+## Command-line use
+
+Start the engine in one terminal:
 
 ```bash
---context "Kubernetes, Anirudh, SLO"   # terms and names for this meeting
---no-mic                               # transcribe only the other side
---no-refine                            # skip sentence refinement, save ~8 GB
---no-overlay                           # record a transcript, show no window
---domain general                       # drop the built-in CS/AI glossary
---font-size 24 --opacity 0.8
+.venv/bin/meeting-subtitles-engine
 ```
+
+Start a meeting in another terminal; this still opens the caption bar:
+
+```bash
+.venv/bin/meeting-subtitles-run --title "Weekly sync" --theme dark
+```
+
+Use `--help` to list all options. For example:
+
+```bash
+# Add terminology and names for this meeting
+.venv/bin/meeting-subtitles-run --context "Kubernetes, Anirudh, SLO"
+
+# Capture system playback only, without sentence refinement
+.venv/bin/meeting-subtitles-run --no-mic --no-refine
+
+# Record without a subtitle window; press Ctrl+C to finish
+.venv/bin/meeting-subtitles-run --no-overlay --formats md,srt,json
+```
+
+Other display options include `--font-size 24 --opacity 0.8`. Use
+`--theme light` or `--theme dark` for that session; omitting it uses the saved
+appearance. Command-line theme overrides do not change the saved preference.
 
 ### Domain terminology
 
-The default preset is **CS / AI research**: 62 terms that get fed to the
-recogniser so acronyms survive (LoRA, RLHF, vLLM, KV cache, NeurIPS, FLOPs),
-plus Chinese conventions for the refiner, so `ablation study` comes out as
-消融实验 rather than something literal. Turn it off with `--domain general`, or
-edit `meeting_subtitles/domain.py` to add your own field.
+The default **CS/AI** preset provides 62 terms, such as LoRA, RLHF, vLLM, and
+NeurIPS, along with translation guidance. In the launcher, turn off
+**计算机与 AI 术语** for a general meeting; from the command line, use
+`--domain general`. Add names or other meeting-specific terms with `--context`.
+To define another preset, edit [domain.py](meeting_subtitles/domain.py).
 
-## Model licenses
+## Backing up models
 
-The code here is Apache-2.0. The models it downloads are not all as permissive,
-and one is worth knowing about before you use this at work:
-
-| Model | License |
-|---|---|
-| Whisper large-v3 | MIT |
-| faster-whisper large-v3 | MIT |
-| **NLLB-200-distilled-1.3B** | **CC-BY-NC-4.0 — non-commercial only** |
-| Qwen3-4B-Instruct-2507 | Apache-2.0 |
-
-NLLB is the streaming translator. If you need commercial use, replace it with a
-different translation backend (see `whisperlivekit --help`), or run with
-`--target-language ""` and rely on the refiner alone.
-
-## Backing up the models
-
-18 GB is slow to fetch twice, especially if `huggingface.co` is unreliable
-where you are. Before wiping a disk:
+Check the cache and back it up before reinstalling or moving to another disk:
 
 ```bash
 .venv/bin/python tools/models.py status
 .venv/bin/python tools/models.py backup --to /mnt/backup/meeting-models
 ```
 
-and afterwards:
+Restore it with:
 
 ```bash
 .venv/bin/python tools/models.py restore --from /mnt/backup/meeting-models
 ```
 
-## Known limits
+## Limitations
 
-- **Linux only.** macOS would need a virtual audio device such as BlackHole;
-  Windows would need a WASAPI loopback backend. Neither is implemented.
-- **English in, Chinese out.** The source language is pinned to English on
-  purpose — letting Whisper auto-detect costs noticeable accuracy on accented
-  speech, which is exactly the case this exists for.
-- **One mixed stream**, so the transcript does not say who spoke. Start the
-  engine with `--diarization` if you need that.
-- Whisper occasionally hallucinates a short phrase during long silences. Real
-  meetings have enough room tone that this is rarer than it is on digital
-  silence.
+- **Linux only.** Audio capture backends for macOS and Windows are not implemented.
+- **Designed for English-to-Chinese meetings.** Other language pairs are not part
+  of the default tested workflow.
+- **Mixed audio.** System playback and the microphone are combined into one stream;
+  the default setup does not distinguish individual speakers.
+- **Recognition is imperfect.** Accents, overlapping speech, noise, and long silences
+  can cause mistakes or spurious text. Review saved transcripts before reusing them.
+- **Whole-window opacity.** Tk fades both the caption background and its text.
+  Increase opacity when captions are hard to read over the meeting window.
 
-## Changing the code
+## Licenses
 
-Start with [AGENTS.md](AGENTS.md) — build commands, architecture, and the
-traps that cost real time here. Every AI coding agent reads it too; Claude
-Code picks it up through `CLAUDE.md`.
+The project code is [Apache-2.0](LICENSE). Model weights have separate licenses:
 
-## Credits
+| Model | License |
+| --- | --- |
+| [Whisper large-v3 (.pt checkpoint)](https://github.com/openai/whisper#license) | MIT |
+| [faster-whisper large-v3](https://huggingface.co/Systran/faster-whisper-large-v3) | MIT |
+| [NLLB-200-distilled-1.3B](https://huggingface.co/facebook/nllb-200-distilled-1.3B) | CC-BY-NC-4.0 |
+| [Qwen3-4B-Instruct-2507](https://huggingface.co/Qwen/Qwen3-4B-Instruct-2507) | Apache-2.0 |
 
-The transcription engine is [WhisperLiveKit](https://github.com/QuentinFuxa/WhisperLiveKit)
-by Quentin Fuxa (Apache-2.0), which this project installs as a dependency and
-drives — no engine source is copied here. It in turn builds on SimulStreaming
-and whisper_streaming (ÚFAL), silero-vad (snakers4) and NeMo (NVIDIA). See
-[NOTICE](NOTICE).
+The default streaming translator, NLLB, is licensed for non-commercial use. The
+project's code license does not override those model terms. See the linked model
+licenses before using a configuration commercially.
 
-Licensed under Apache-2.0. See [LICENSE](LICENSE).
+## Development and credits
+
+Read [AGENTS.md](AGENTS.md) for development commands, architecture, and known
+implementation pitfalls. [Design notes](docs/design-notes.zh-CN.md) explain the
+text pipeline and operating details in Chinese; [DESIGN.md](DESIGN.md) records
+the interface conventions.
+
+The transcription server is [WhisperLiveKit](https://github.com/QuentinFuxa/WhisperLiveKit)
+by Quentin Fuxa. This project installs and runs it as a dependency; it does not
+copy the engine's source. Upstream dependencies and acknowledgments are listed
+in [NOTICE](NOTICE).
