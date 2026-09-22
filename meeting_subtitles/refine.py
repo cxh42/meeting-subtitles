@@ -27,8 +27,7 @@ logger = logging.getLogger(__name__)
 
 # Set before anything can import huggingface_hub in this process (see _load).
 # ``setdefault`` on purpose: HF_HUB_OFFLINE=0 in the environment is the one
-# supported way to let this process download the model, which is what the
-# README's snapshot_download line uses.
+# supported way to let this process download the model.
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 # The Xet transfer backend fails behind many local proxies and buys nothing
 # for a load that is meant to be offline anyway.
@@ -229,8 +228,8 @@ class TranslationRefiner:
             raise RuntimeError(
                 f"本地没有润色模型 {self.model_id}，且当前是离线模式。\n"
                 "先下载一次（需要能连上 huggingface.co）：\n"
-                "  HF_HUB_OFFLINE=0 .venv/bin/python -c \"from huggingface_hub import "
-                f"snapshot_download; snapshot_download('{self.model_id}')\"\n"
+                f"  uv run python tools/models.py --refine '{self.model_id}' "
+                "download --only refine\n"
                 "或在启动器里关闭「整句润色」。"
             )
 

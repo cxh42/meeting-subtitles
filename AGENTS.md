@@ -10,18 +10,19 @@ how not to break it. Long-form rationale lives in
 ## Commands
 
 ```bash
-.venv/bin/meeting-subtitles-doctor       # run FIRST when anything misbehaves
-.venv/bin/python -m pytest tests -q      # no GPU, no audio, no network
-.venv/bin/ruff check meeting_subtitles tools tests
-.venv/bin/meeting-subtitles-engine       # the server, foreground
-./install.sh                             # venv + deps + desktop entry
+uv run --no-sync meeting-subtitles-doctor       # run FIRST when anything misbehaves
+uv run --no-sync python -m pytest tests -q      # no GPU, no audio, no network
+uv run --no-sync ruff check meeting_subtitles tools tests
+uv run --no-sync meeting-subtitles-engine       # the server, foreground
+./install.sh                                   # uv environment + locked deps + desktop entry
 
-.venv/bin/python tools/replay.py <audio.wav>   # re-run a meeting through the engine
-.venv/bin/python tools/models.py prune         # list dead model blobs (--yes deletes)
+uv run --no-sync python tools/models.py download       # download engine + refinement models
+uv run --no-sync python tools/replay.py <audio.wav>     # re-run a meeting through the engine
+uv run --no-sync python tools/models.py prune          # list dead model blobs (--yes deletes)
 ```
 
 Screenshots in `docs/images/` are generated, never hand-edited:
-`xvfb-run -a -s "-screen 0 1920x1080x24 -nocursor" .venv/bin/python tools/screenshots.py --out docs/images`
+`xvfb-run -a -s "-screen 0 1920x1080x24 -nocursor" uv run --no-sync python tools/screenshots.py --out docs/images`
 
 ## Shape
 
@@ -95,14 +96,13 @@ Each of these failed silently or blamed the wrong thing. All are current.
   `libcublas.so.12`. The engine starts, answers `/health`, accepts audio, then
   fails every chunk and writes an empty transcript.
   `ctranslate2.get_cuda_device_count()` still returns 1, so probe with
-  `ctypes.CDLL("libcublas.so.12")`. Install torch from the cu12x index, with
-  `--force-reinstall` — pip will not replace an already-satisfied torch just
-  because the index changed.
+  `ctypes.CDLL("libcublas.so.12")`. Keep the explicit CUDA 12 PyTorch source
+  and its lockfile; `./install.sh` restores that selection with uv.
 - **The released whisperlivekit silently ignores the glossary.** `?context=`
   arrived after 0.2.26, and an older server drops an unknown query parameter
   without complaining, so terminology conditioning just stops happening.
-  `pyproject.toml` allows the PyPI release; `install.sh` pins the commit that
-  has it. `doctor.py` probes for `session_asr_proxy.session_context_capability`
+  The uv source in `pyproject.toml` pins the commit that has it.
+  `doctor.py` probes for `session_asr_proxy.session_context_capability`
   rather than trusting the version number.
 - **`HF_HUB_OFFLINE` is read at import time.** `huggingface_hub` freezes it
   into a module constant. Setting it after the import does nothing and the
@@ -126,8 +126,8 @@ Each of these failed silently or blamed the wrong thing. All are current.
   failure. Match against a variable instead.
 - **`pkill -f <pattern>` matches the shell running it.** Never put the pattern
   literally in the same command.
-- **Anaconda's Tk has no Xft**, so it sees no CJK font and renders Chinese as
-  boxes. `tkfix.py` re-execs once with the system Tcl/Tk preloaded; a test
+- **Some managed Python Tk builds have no Xft**, so they see no CJK font and
+  render Chinese as boxes. `tkfix.py` verifies a matching system Tk before re-exec; a test
   that calls `ensure_cjk_tk` will re-exec into whatever `module=` says.
 - **`pactl` translates its field labels.** Parsers must force `LC_ALL=C`.
 - **Desktop launchers inherit no shell environment**, so a proxy in `.bashrc`

@@ -2,8 +2,8 @@
 
 Run this first, after installing and after any system upgrade::
 
-    meeting-subtitles-doctor
-    python -m meeting_subtitles.doctor
+    uv run --no-sync meeting-subtitles-doctor
+    uv run --no-sync python -m meeting_subtitles.doctor
 
 Everything the app needs is checked separately, so a failure names one thing to
 fix rather than leaving you to guess which of ffmpeg, PulseAudio, CUDA, Tk or
@@ -139,7 +139,7 @@ def check_gpu() -> Result:
     try:
         import torch
     except ImportError:
-        return Result(FAIL, "PyTorch", "未安装", "pip install -e .")
+        return Result(FAIL, "PyTorch", "未安装", "./install.sh")
     if not torch.cuda.is_available():
         return Result(WARN, "GPU", f"torch {torch.__version__}，CUDA 不可用",
                       "会退到 CPU 运行，实时性达不到要求。\n"
@@ -166,7 +166,7 @@ def check_ctranslate2_cuda() -> Result:
     try:
         import torch
     except ImportError:
-        return Result(FAIL, "CTranslate2", "PyTorch 未安装", "pip install -e .")
+        return Result(FAIL, "CTranslate2", "PyTorch 未安装", "./install.sh")
     if not torch.cuda.is_available():
         return Result(WARN, "CTranslate2", "CUDA 不可用，跳过检查")
     cuda = torch.version.cuda or "?"
@@ -176,15 +176,14 @@ def check_ctranslate2_cuda() -> Result:
         return Result(
             FAIL, "CTranslate2", f"找不到 libcublas.so.12（当前 torch 带的是 CUDA {cuda}）",
             "引擎会正常启动但每一段音频都识别失败，转录是空的。\n"
-            "PyPI 上默认的 torch 现在带 CUDA 13，而 CTranslate2 需要 CUDA 12：\n"
-            "pip install --force-reinstall torch torchaudio "
-            "--index-url https://download.pytorch.org/whl/cu129")
+            "CTranslate2 需要 CUDA 12；重新安装项目锁定的 PyTorch 版本：\n"
+            "./install.sh")
     return Result(OK, "CTranslate2", f"libcublas.so.12 可加载（CUDA {cuda}）")
 
 
 def check_engine_package() -> Result:
     if importlib.util.find_spec("whisperlivekit") is None:
-        return Result(FAIL, "whisperlivekit", "未安装", "pip install -e .")
+        return Result(FAIL, "whisperlivekit", "未安装", "./install.sh")
     try:
         from importlib.metadata import version
         installed = version("whisperlivekit")
@@ -201,10 +200,19 @@ def check_engine_package() -> Result:
     if not supported:
         return Result(WARN, "whisperlivekit", f"{installed}（不支持术语条件化）",
                       "领域术语表会被静默忽略，识别专有名词的准确率会下降。\n"
-                      "装带该功能的版本：\n"
-                      "pip install 'whisperlivekit @ "
-                      "git+https://github.com/QuentinFuxa/WhisperLiveKit@b781ce9'")
+                      "用 uv 恢复项目锁定的引擎版本：\n"
+                      "./install.sh")
     return Result(OK, "whisperlivekit", f"{installed}（支持术语条件化）")
+
+
+def check_compiler() -> Result:
+    # Triton builds its CUDA launcher locally; without a compiler Whisper
+    # misleadingly blames the CUDA toolkit and falls back to slower kernels.
+    compiler = shutil.which(os.environ.get("CC", "cc"))
+    if compiler is None:
+        return Result(WARN, "GPU 内核编译", "未找到 C 编译器，会使用较慢的回退实现",
+                      "sudo apt install build-essential")
+    return Result(OK, "GPU 内核编译", compiler)
 
 
 def check_models() -> Result:
@@ -221,9 +229,10 @@ def check_models() -> Result:
         missing.append("NLLB-1.3B")
     if missing:
         return Result(WARN, "模型缓存", "缺少 " + "、".join(missing),
-                      "首次启动引擎时会自动下载（约 18 GB，需要能连上 "
-                      "huggingface.co）。\n"
-                      "已有备份的话：python tools/models.py restore --from <目录>")
+                      "先下载引擎模型（需要能连上 huggingface.co）：\n"
+                      "uv run --no-sync python tools/models.py download --only engine\n"
+                      "已有备份的话：uv run --no-sync python tools/models.py "
+                      "restore --from <目录>")
     return Result(OK, "模型缓存", "已就绪，可离线启动")
 
 
@@ -239,7 +248,7 @@ def check_free_vram() -> Result:
     try:
         import torch
     except ImportError:
-        return Result(FAIL, "可用显存", "PyTorch 未安装", "pip install -e .")
+        return Result(FAIL, "可用显存", "PyTorch 未安装", "./install.sh")
     if not torch.cuda.is_available():
         return Result(WARN, "可用显存", "CUDA 不可用，跳过检查")
     gb = 1024 ** 3
@@ -268,8 +277,7 @@ def check_refine_model() -> Result:
         return Result(WARN, "润色模型", f"未下载 {refine.DEFAULT_MODEL}",
                       "整句润色会自动跳过，字幕只显示流式译文。\n"
                       "要用的话先下载一次（约 7.6 GB，需要能连上 huggingface.co）：\n"
-                      "HF_HUB_OFFLINE=0 .venv/bin/python -c \"from huggingface_hub import "
-                      f"snapshot_download; snapshot_download('{refine.DEFAULT_MODEL}')\"")
+                      "uv run --no-sync python tools/models.py download --only refine")
     size = refine.weights_bytes(refine.DEFAULT_MODEL) / 1024 ** 3
     return Result(OK, "润色模型", f"{refine.DEFAULT_MODEL}（{size:.1f} GB，可离线加载）")
 
@@ -280,9 +288,27 @@ def check_tk_fonts() -> Result:
                       "无法检查字体。字幕窗口需要图形会话；"
                       "纯命令行下可用 --no-overlay。")
     try:
-        from meeting_subtitles.tkfix import cjk_families
+        import tkinter as tk
+
+        from meeting_subtitles.tkfix import (
+            cjk_families,
+            system_cjk_families,
+            system_tk_environment,
+        )
     except ImportError as exc:
-        return Result(FAIL, "Tk", str(exc)[:70], "sudo apt install python3-tk")
+        return Result(FAIL, "Tk", str(exc)[:70],
+                      "重新运行 ./install.sh，使用项目指定的 Python。\n"
+                      "系统 Python 缺少 Tk 时，先运行 sudo apt install python3-tk。")
+    # cjk_families treats a failed Tk startup like a missing font; verify the
+    # interpreter and display first so installed fonts cannot hide a broken Tk.
+    try:
+        root = tk.Tk()
+        root.withdraw()
+        root.destroy()
+    except tk.TclError as exc:
+        return Result(FAIL, "Tk", str(exc)[:70],
+                      "确认在可访问的桌面会话中运行，再重新运行 ./install.sh。\n"
+                      "无图形界面时可以使用 --no-overlay。")
     families = cjk_families()
     if families:
         return Result(OK, "中文字体", families[0])
@@ -291,11 +317,12 @@ def check_tk_fonts() -> Result:
     # user to install a font they already have is worse than saying nothing.
     installed = _run(["fc-list", ":lang=zh-cn", "family"]) or ""
     if installed.strip():
-        first = installed.splitlines()[0].split(",")[0]
-        return Result(OK, "中文字体", f"{first}（Tk 需要预加载系统 Tcl/Tk）",
-                      "这个 Python 的 Tk 是没有 Xft 的构建（Anaconda 常见），"
-                      "看不到系统字体。\n"
-                      "启动时会自动改用系统 Tcl/Tk 重新执行一次，中文能正常显示。")
+        repaired = system_cjk_families(system_tk_environment())
+        if repaired:
+            return Result(OK, "中文字体", f"{repaired[0]}（系统 Tk 替换已验证）")
+        return Result(FAIL, "Tk", "字体或后台回调检查未通过",
+                      "重新运行 ./install.sh，使用 .python-version 指定的 Python。\n"
+                      "Tk 8.6 系统库缺失时：sudo apt install libtk8.6")
     return Result(WARN, "中文字体", "系统里没有安装中文字体",
                   "界面里的中文会显示成方块。\n"
                   "sudo apt install fonts-noto-cjk")
@@ -315,14 +342,14 @@ def check_display_server() -> Result:
 def check_rounding() -> Result:
     if importlib.util.find_spec("Xlib") is None:
         return Result(WARN, "窗口圆角", "未安装 python-xlib",
-                      "窗口会是直角，功能不受影响。\n     pip install python-xlib")
+                      "窗口会是直角，功能不受影响。\n./install.sh")
     return Result(OK, "窗口圆角", "python-xlib 可用")
 
 
 def check_process_control() -> Result:
     if importlib.util.find_spec("psutil") is None:
         return Result(WARN, "引擎关闭", "未安装 psutil",
-                      "启动器里的「关闭引擎」按钮会失效。\npip install psutil")
+                      "启动器里的「关闭引擎」按钮会失效。\n./install.sh")
     return Result(OK, "引擎关闭", "psutil 可用")
 
 
@@ -331,12 +358,12 @@ def check_engine_running() -> Result:
         return Result(OK, "引擎状态", "正在运行")
     return Result(WARN, "引擎状态", "未运行",
                   "这是正常的——启动器会在需要时自动拉起。\n"
-                  "也可以手动启动：meeting-subtitles-engine")
+                  "也可以手动启动：uv run --no-sync meeting-subtitles-engine")
 
 
 CHECKS = (
     ("环境", [check_python, check_engine_package, check_gpu,
-              check_ctranslate2_cuda, check_free_vram]),
+              check_ctranslate2_cuda, check_compiler, check_free_vram]),
     ("音频", [check_ffmpeg, check_audio_server, check_monitor_source,
               check_microphone]),
     ("界面", [check_display_server, check_tk_fonts, check_rounding]),

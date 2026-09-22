@@ -1,11 +1,12 @@
-"""Back up the downloaded models, and put them back after a reinstall.
+"""Download models, back them up, and restore them after a reinstall.
 
-The four models this app uses come to about 23 GB. Downloading them again is
+The four models this app uses come to about 18.4 GiB. Downloading them again is
 slow at the best of times, and on a network where ``huggingface.co`` does not
 resolve it is the kind of slow that looks like a hang. Copying the cache onto
 another disk before wiping the system, and copying it back afterwards, turns
 that into a file copy.
 
+    uv run python tools/models.py download --proxy http://127.0.0.1:7897
     python tools/models.py backup  --to /mnt/backup/meeting-models
     python tools/models.py restore --from /mnt/backup/meeting-models
     python tools/models.py status
@@ -25,9 +26,13 @@ Two details matter and are handled here:
 """
 
 import argparse
+import hashlib
 import os
 import shutil
 import sys
+import tempfile
+import urllib.request
+import wave
 from pathlib import Path
 
 DEFAULT_WHISPER = "large-v3"
@@ -36,13 +41,14 @@ DEFAULT_REFINE = "Qwen/Qwen3-4B-Instruct-2507"
 
 
 def hf_cache() -> Path:
-    explicit = os.environ.get("HUGGINGFACE_HUB_CACHE")
+    explicit = os.environ.get("HF_HUB_CACHE") or os.environ.get("HUGGINGFACE_HUB_CACHE")
     if explicit:
-        return Path(explicit)
+        return Path(explicit).expanduser()
     home = os.environ.get("HF_HOME")
     if home:
-        return Path(home) / "hub"
-    return Path.home() / ".cache" / "huggingface" / "hub"
+        return Path(home).expanduser() / "hub"
+    cache = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+    return cache.expanduser() / "huggingface" / "hub"
 
 
 def whisper_cache() -> Path:
@@ -56,6 +62,165 @@ def human(size: float) -> str:
             return f"{size:.1f} {unit}"
         size /= 1024
     return ""
+
+
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def download_checkpoint(model: str) -> None:
+    from whisperlivekit.whisper import _MODELS
+
+    if model not in _MODELS:
+        raise ValueError(f"不支持 Whisper 模型 {model}；可选：{', '.join(_MODELS)}")
+    url = _MODELS[model]
+    expected = url.split("/")[-2]
+    target = whisper_cache() / f"{model}.pt"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    print(f"\nWhisper {model}: {target}", flush=True)
+    if target.is_file() and sha256(target) == expected:
+        print("  文件已存在，SHA256 校验通过。", flush=True)
+        return
+
+    # The engine treats any final checkpoint as usable; only expose a fully
+    # verified file, and leave interrupted transfers available for resuming.
+    partial = target.with_suffix(".pt.partial")
+    if partial.is_file() and sha256(partial) == expected:
+        partial.replace(target)
+        return
+    offset = partial.stat().st_size if partial.is_file() else 0
+    headers = {"Range": f"bytes={offset}-"} if offset else {}
+    request = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(request, timeout=60) as response:
+        if response.status == 206:
+            content_range = response.headers.get("Content-Range", "")
+            if not content_range.startswith(f"bytes {offset}-"):
+                raise RuntimeError("服务器返回了错误的续传位置；请重试下载。")
+        else:
+            offset = 0
+        total = offset + int(response.headers.get("Content-Length", 0))
+        written = offset
+        reported = offset
+        with partial.open("ab" if offset else "wb") as output:
+            while chunk := response.read(1024 * 1024):
+                output.write(chunk)
+                written += len(chunk)
+                if written - reported >= 256 * 1024 * 1024:
+                    print(f"  已下载 {human(written)} / {human(total)}", flush=True)
+                    reported = written
+    if sha256(partial) != expected:
+        partial.unlink()
+        raise RuntimeError("Whisper 文件校验失败，已移除损坏的临时文件；请重试下载。")
+    partial.replace(target)
+    print("  下载完成，SHA256 校验通过。", flush=True)
+
+
+def download_repository(repo_id: str, max_workers: int) -> None:
+    from huggingface_hub import HfApi, snapshot_download
+
+    print(f"\n下载 {repo_id}…", flush=True)
+    info = HfApi().model_info(repo_id, files_metadata=True)
+    files = [item.rfilename for item in info.siblings]
+    # Some repositories publish several weight formats. Fetch only the one
+    # transformers will use, avoiding a second multi-gigabyte copy.
+    weights = "*.safetensors" if any(f.endswith(".safetensors") for f in files) else "*.bin"
+    destination = snapshot_download(
+        repo_id,
+        allow_patterns=[weights, "*.json", "*.model", "*.txt", "*.jinja", "LICENSE*"],
+        cache_dir=str(hf_cache()),
+        max_workers=max_workers,
+    )
+    print(f"  已就绪: {destination}", flush=True)
+
+
+def download_warmup() -> None:
+    from meeting_subtitles import paths
+
+    target = paths.ensure(paths.cache_dir()) / "warmup.wav"
+    if target.is_file():
+        try:
+            with wave.open(str(target)) as audio:
+                if audio.getnframes() > 0:
+                    print(f"预热音频已缓存: {target}", flush=True)
+                    return
+        except (OSError, EOFError, wave.Error):
+            pass
+    # Upstream fetches this sample into /tmp during startup, even offline.
+    # Keep a persistent copy so a reboot does not trigger another request.
+    url = "https://raw.githubusercontent.com/ggerganov/whisper.cpp/master/samples/jfk.wav"
+    partial = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=target.parent, suffix=".wav", delete=False) as output:
+            partial = Path(output.name)
+            with urllib.request.urlopen(url, timeout=60) as response:
+                shutil.copyfileobj(response, output)
+        with wave.open(str(partial)) as audio:
+            if audio.getnframes() == 0:
+                raise ValueError("下载的预热音频为空，请重试。")
+        partial.replace(target)
+    finally:
+        if partial is not None:
+            partial.unlink(missing_ok=True)
+    print(f"预热音频已缓存: {target}", flush=True)
+
+
+def cmd_download(args) -> int:
+    if args.max_workers < 1:
+        print("错误：--max-workers 必须至少为 1。", file=sys.stderr)
+        return 2
+    repositories = []
+    if args.only != "refine":
+        repositories.extend([
+            f"Systran/faster-whisper-{args.whisper}",
+            f"facebook/nllb-200-distilled-{args.nllb}",
+        ])
+    if args.only != "engine" and args.refine:
+        repositories.append(args.refine)
+    print("将下载以下模型（已有文件会复用，中断后可重新运行）：")
+    if args.only != "refine":
+        print(f"  Whisper {args.whisper} 原始检查点")
+    for repo_id in repositories:
+        print(f"  {repo_id}")
+    if args.dry_run:
+        return 0
+
+    try:
+        from meeting_subtitles.serve import apply_env_file, normalise_proxies
+
+        apply_env_file()
+        if args.proxy:
+            for name in ("http_proxy", "https_proxy", "all_proxy"):
+                os.environ[name] = os.environ[name.upper()] = args.proxy
+        normalise_proxies()
+        # Downloads explicitly opt into the network before Hub/transformers
+        # import their settings; normal meeting startup stays offline.
+        os.environ["HF_HUB_OFFLINE"] = "0"
+        os.environ["TRANSFORMERS_OFFLINE"] = "0"
+        os.environ["HF_HUB_DISABLE_XET"] = "1"
+        os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "30")
+        os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "60")
+        print(f"\nHugging Face 缓存: {hf_cache()}", flush=True)
+        for repo_id in repositories:
+            download_repository(repo_id, args.max_workers)
+        if args.only != "refine":
+            download_checkpoint(args.whisper)
+            download_warmup()
+    except KeyboardInterrupt:
+        print("\n下载已中断。重新运行相同命令即可继续。", file=sys.stderr)
+        return 130
+    except ImportError as exc:
+        print(f"错误：缺少下载依赖（{exc}）。请先运行 ./install.sh。", file=sys.stderr)
+        return 1
+    except Exception as exc:
+        print(f"\n下载失败：{exc}\n请检查代理、剩余磁盘空间后重新运行本命令；"
+              "可用 --proxy http://127.0.0.1:7897 指定代理。", file=sys.stderr)
+        return 1
+    print("\n所选模型已下载。运行 uv run --no-sync meeting-subtitles-doctor 检查部署。")
+    return 0
 
 
 def repo_names(args) -> list[str]:
@@ -339,15 +504,25 @@ def cmd_status(args) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="备份 / 恢复会议字幕用到的本地模型（约 23 GB）。")
+        description="下载 / 备份 / 恢复会议字幕用到的本地模型（约 18.4 GiB）。")
     parser.add_argument("--whisper", default=DEFAULT_WHISPER)
     parser.add_argument("--nllb", default=DEFAULT_NLLB)
     parser.add_argument("--refine", default=DEFAULT_REFINE,
                         help="整句润色模型；传空字符串可跳过（省 7.6 GB）")
     parser.add_argument("--all-revisions", action="store_true",
                         help="连同 pull-request 等其它 revision 一起处理（通常没必要）")
-    parser.add_argument("--dry-run", action="store_true", help="只列出，不复制")
+    parser.add_argument("--dry-run", action="store_true", help="只列出，不下载或复制")
     sub = parser.add_subparsers(dest="command", required=True)
+
+    download = sub.add_parser("download", help="下载首次部署所需模型，支持重复运行")
+    download.add_argument("--proxy", help="下载代理，例如 http://127.0.0.1:7897")
+    download.add_argument("--only", choices=("all", "engine", "refine"), default="all",
+                          help="下载全部模型、仅识别和翻译模型、或仅润色模型")
+    download.add_argument("--max-workers", type=int, default=3,
+                          help="同时下载的文件数（默认 3）")
+    download.add_argument("--dry-run", action="store_true", default=argparse.SUPPRESS,
+                          help="只列出要下载的模型，不联网")
+    download.set_defaults(func=cmd_download)
 
     backup = sub.add_parser("backup", help="把模型复制到备份目录")
     backup.add_argument("--to", required=True, metavar="目录")

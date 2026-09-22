@@ -26,6 +26,7 @@ on this machine:
 """
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -78,13 +79,15 @@ def hf_cache() -> Path:
     in exactly the place the library will look, not in the place this app
     would have chosen.
     """
-    explicit = os.environ.get("HUGGINGFACE_HUB_CACHE")
+    explicit = (os.environ.get("HF_HUB_CACHE")
+                or os.environ.get("HUGGINGFACE_HUB_CACHE"))
     if explicit:
-        return Path(explicit)
+        return Path(explicit).expanduser()
     home = os.environ.get("HF_HOME")
     if home:
-        return Path(home) / "hub"
-    return Path.home() / ".cache" / "huggingface" / "hub"
+        return Path(home).expanduser() / "hub"
+    cache = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+    return cache.expanduser() / "huggingface" / "hub"
 
 
 def whisper_cache() -> Path:
@@ -94,11 +97,29 @@ def whisper_cache() -> Path:
 
 
 def has_snapshot(repo_dir: str, pattern: str) -> bool:
-    """True when a Hub repo is cached with at least one file matching."""
+    """True when matching files and every indexed weight shard are cached."""
     snapshots = hf_cache() / repo_dir / "snapshots"
     if not snapshots.is_dir():
         return False
-    return any(revision.glob(pattern) for revision in snapshots.iterdir())
+    for revision in snapshots.iterdir():
+        # A glob iterator itself is always truthy, even for an empty snapshot.
+        if not any(item.is_file() for item in revision.glob(pattern)):
+            continue
+        complete = True
+        for index in revision.glob(f"{pattern}.index.json"):
+            try:
+                required = set(json.loads(index.read_text())["weight_map"].values())
+                # One small Qwen shard can finish well before the large ones.
+                # Calling that model cached prematurely forces a failed offline load.
+                complete = bool(required) and all(
+                    (revision / name).is_file() for name in required)
+            except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                complete = False
+            if not complete:
+                break
+        if complete:
+            return True
+    return False
 
 
 def models_cached(model: str, target_language: str, nllb_size: str) -> bool:
@@ -157,6 +178,9 @@ def parse_args(argv=None) -> argparse.Namespace:
 
 
 def build_argv(args: argparse.Namespace) -> list[str]:
+    # Upstream's default downloads a sample into /tmp even in Hub offline mode.
+    # The deployment tool caches it persistently; without it, warm up on speech.
+    warmup = paths.cache_dir() / "warmup.wav"
     argv = [
         "wlk",
         "--host", args.host,
@@ -167,6 +191,7 @@ def build_argv(args: argparse.Namespace) -> list[str]:
         "--nllb-size", args.nllb_size,
         "--pause-segmentation-seconds", str(args.pause_seconds),
         "--pcm-input",
+        "--warmup-file", str(warmup) if warmup.is_file() else "",
         "--log-level", args.log_level,
     ]
     extra = [a for a in args.rest if a != "--"]

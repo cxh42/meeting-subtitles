@@ -9,7 +9,7 @@ description = "Real-time English→Chinese meeting subtitles that run entirely o
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.14"
 authors = [{ name = "cxh42" }]
 keywords = [
     "subtitles", "transcription", "translation", "whisper", "speech-to-text",
@@ -34,7 +34,7 @@ dependencies = [
     # which is what actually runs NLLB in-process alongside Whisper.
     "whisperlivekit[translation]>=0.2.26",
     # Whole-sentence refinement runs a local instruct model directly.
-    "transformers>=4.40",
+    "transformers>=4.55,<5",
     "accelerate>=0.26",
     "websockets>=12",
     # Finds the engine by the port it holds, so "stop engine" works even for
@@ -43,10 +43,29 @@ dependencies = [
     # Rounded corners via the X11 SHAPE extension. Optional in practice --
     # without it windows are square -- but small enough to just depend on.
     "python-xlib>=0.33",
+    # CTranslate2 needs CUDA 12 libraries; the uv source below also supports
+    # Blackwell GPUs without falling back to the CUDA 13 build on PyPI.
+    "torch>=2.7,<3",
+    "torchaudio>=2.7,<3",
 ]
 
-[project.optional-dependencies]
+[dependency-groups]
 dev = ["ruff>=0.6", "pytest>=8.0"]
+
+[tool.uv]
+environments = ["sys_platform == 'linux' and platform_machine == 'x86_64'"]
+
+[tool.uv.sources]
+# This commit supports per-session glossary context; the released 0.2.26
+# silently ignores it. Every uv entrypoint must install the same engine.
+whisperlivekit = { git = "https://github.com/QuentinFuxa/WhisperLiveKit", rev = "b781ce9" }
+torch = { index = "pytorch-cu128" }
+torchaudio = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
 
 [project.urls]
 Homepage = "https://github.com/cxh42/meeting-subtitles"
@@ -64,7 +83,7 @@ packages = ["meeting_subtitles"]
 
 [tool.hatch.build.targets.sdist]
 include = ["meeting_subtitles", "tools", "docs", "install.sh", "README*.md",
-           "LICENSE", "NOTICE"]
+           ".python-version", "uv.lock", "LICENSE", "NOTICE"]
 
 [tool.ruff]
 target-version = "py311"

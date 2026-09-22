@@ -1,20 +1,23 @@
 """Make Tk able to render Chinese, whatever interpreter we were started with.
 
-Linux only, and only for one specific breakage: Anaconda ships a
-``libtk8.6.so`` built without Xft or fontconfig. Such a Tk can only use X core
+Linux only, and only for one specific breakage: some managed Python builds
+ship Tk without Xft or fontconfig. Such a Tk can only use X core
 bitmap fonts -- it never sees the installed Noto CJK families, so every Chinese
 string in the launcher and the subtitle overlay comes out as empty boxes.
-Ubuntu's own tk8.6 *is* built with Xft and does see them.
+Ubuntu's own Tk is built with Xft and does see them.
 
 Rather than demanding a particular interpreter, we detect the broken case at
-startup and re-exec once with the system Tcl/Tk preloaded. Anaconda and Ubuntu
-both ship 8.6.x, so the ABI matches; if anything about the detection fails we
-carry on with the fonts we have rather than refusing to start.
+startup and re-exec once with a compatible system Tk preloaded. Probe that
+environment in a child first: mismatched libraries or Tcl scripts can prevent
+Tk from starting at all.
 """
 
+import json
 import logging
 import os
+import subprocess
 import sys
+import threading
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -31,20 +34,70 @@ LIB_DIRS = (
 CJK_MARKERS = ("CJK", "Han Sans", "Han Serif", "WenQuanYi", "Heiti", "Hei")
 
 
-def system_tcl_tk() -> tuple[str, str] | None:
-    """Paths to the system libtcl/libtk pair, when both are present."""
+def _system_library(pattern: str) -> str | None:
     for directory in LIB_DIRS:
-        base = Path(directory)
-        if not base.is_dir():
-            continue
-        tcl = sorted(base.glob("libtcl8.6.so*"))
-        tk = sorted(base.glob("libtk8.6.so*"))
-        if tcl and tk:
-            return str(tcl[0]), str(tk[0])
+        matches = sorted(Path(directory).glob(pattern))
+        if matches:
+            return str(matches[0])
     return None
 
 
-def cjk_families() -> list[str]:
+def _script_directory(name: str, filename: str) -> str | None:
+    for directory in ("/usr/share/tcltk", "/usr/lib", "/usr/share"):
+        candidate = Path(directory) / name
+        if (candidate / filename).is_file():
+            return str(candidate)
+    return None
+
+
+def system_tk_environment() -> dict | None:
+    """A system Tk matching this interpreter, including its startup scripts."""
+    try:
+        import tkinter as tk
+    except ImportError:
+        return None
+    try:
+        version = str(tk.TkVersion)
+        # The pinned interpreter uses Tk 8.6. Its newer managed builds use Tk 9
+        # and lose worker callbacks even when a system Tk repairs the fonts.
+        if version != "8.6":
+            return None
+        tk_library = _script_directory(f"tk{version}", "tk.tcl")
+        libraries = [_system_library(f"libtcl{version}.so*"),
+                     _system_library(f"libtk{version}.so*")]
+        tcl_library = _script_directory(f"tcl{version}", "init.tcl")
+        if not all(libraries) or not tk_library or not tcl_library:
+            return None
+    except (RuntimeError, tk.TclError):
+        return None
+    environment = dict(os.environ)
+    preload = os.pathsep.join(libraries)
+    existing = environment.get("LD_PRELOAD", "")
+    environment["LD_PRELOAD"] = f"{existing}:{preload}" if existing else preload
+    # Tcl scripts require their exact library patch version, not only the ABI.
+    environment["TCL_LIBRARY"] = tcl_library
+    environment["TK_LIBRARY"] = tk_library
+    environment[GUARD_ENV] = "1"
+    return environment
+
+
+def system_cjk_families(environment: dict | None) -> list[str]:
+    """Verify the proposed repair without risking the running GUI process."""
+    if environment is None:
+        return []
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", "import json; "
+             "from meeting_subtitles.tkfix import cjk_families; "
+             "print(json.dumps(cjk_families(check_callbacks=True)))"],
+            env=environment, capture_output=True, text=True, timeout=5, check=True,
+        )
+        return json.loads(result.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return []
+
+
+def cjk_families(*, check_callbacks: bool = False) -> list[str]:
     """CJK-capable font families the current Tk can actually use.
 
     Returns an empty list when Tk cannot start at all (no display, for example),
@@ -60,6 +113,26 @@ def cjk_families() -> list[str]:
         root = tk.Tk()
         root.withdraw()
         families = set(tkfont.families(root))
+        if check_callbacks:
+            delivered = []
+
+            def finish():
+                delivered.append(True)
+                root.quit()
+
+            def worker():
+                try:
+                    root.after(0, finish)
+                except (RuntimeError, tk.TclError):
+                    pass
+
+            # Some Tk builds render correctly but drop every worker callback.
+            # That leaves the launcher checking forever and the overlay empty.
+            root.after(10, lambda: threading.Thread(target=worker, daemon=True).start())
+            root.after(1500, root.quit)
+            root.mainloop()
+            if not delivered:
+                return []
     except Exception:
         return []
     finally:
@@ -93,19 +166,13 @@ def ensure_cjk_tk(module: str | None = None) -> None:
     if cjk_families():
         return
 
-    libs = system_tcl_tk()
-    if libs is None:
+    environment = system_tk_environment()
+    if not system_cjk_families(environment):
         logger.warning(
-            "Tk 看不到任何中文字体，且未找到系统 Tcl/Tk 可供替换；"
-            "界面中的中文可能显示为方块。"
+            "Tk 无法显示中文，且系统 Tk 替换检查未通过；"
+            "请运行 uv run --no-sync meeting-subtitles-doctor 查看修复方法。"
         )
         return
-
-    preload = os.pathsep.join(libs)
-    existing = os.environ.get("LD_PRELOAD", "")
-    environment = dict(os.environ)
-    environment["LD_PRELOAD"] = f"{existing}:{preload}" if existing else preload
-    environment[GUARD_ENV] = "1"
 
     if module:
         argv = [sys.executable, "-m", module, *sys.argv[1:]]
@@ -137,4 +204,6 @@ def child_environment() -> dict:
     environment = dict(os.environ)
     environment.pop("LD_PRELOAD", None)
     environment.pop(GUARD_ENV, None)
+    environment.pop("TCL_LIBRARY", None)
+    environment.pop("TK_LIBRARY", None)
     return environment
