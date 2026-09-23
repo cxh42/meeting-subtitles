@@ -5,6 +5,7 @@ row frames are inset because Tk always paints child windows above canvas items,
 including the rounded corners of the surface underneath them.
 """
 
+import math
 import tkinter as tk
 import tkinter.font as tkfont
 from collections.abc import Callable
@@ -99,8 +100,41 @@ def pick_font(root: tk.Misc) -> str:
     return "TkDefaultFont"
 
 
+def _xft_dpi(root: tk.Misc) -> float | None:
+    try:
+        from Xlib import Xatom, display, error, rdb
+    except ImportError:
+        return None
+
+    try:
+        connection = display.Display(root.winfo_screen())
+        try:
+            resources = connection.screen().root.get_full_property(
+                connection.intern_atom("RESOURCE_MANAGER"), Xatom.STRING,
+            )
+        finally:
+            connection.close()
+        if resources is None:
+            return None
+        database = rdb.ResourceDB(string=resources.value.decode("utf-8", errors="replace"))
+        value = database.get("Xft.dpi", "Xft.Dpi")
+        if value is not None:
+            dpi = float(value)
+            if math.isfinite(dpi) and dpi > 0:
+                return dpi
+    except (OSError, ValueError, tk.TclError, error.DisplayError,
+            error.ConnectionClosedError, error.XError):
+        pass
+    return None
+
+
 def screen_scale(root: tk.Misc) -> float:
-    """Pixels per logical unit relative to a nominal 96 DPI display."""
+    """Match pixel geometry to font rendering at a nominal 96 DPI."""
+    # XWayland can report 96 DPI to Tk while Xft renders fonts at 192 DPI.
+    # The font resource must take precedence to keep labels inside controls.
+    dpi = _xft_dpi(root)
+    if dpi is not None:
+        return max(1.0, dpi / 96.0)
     try:
         return max(1.0, float(root.winfo_fpixels("1i")) / 96.0)
     except tk.TclError:
