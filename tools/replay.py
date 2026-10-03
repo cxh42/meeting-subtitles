@@ -28,10 +28,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from meeting_subtitles import audio as audio_mod  # noqa: E402
 from meeting_subtitles import domain as domains  # noqa: E402
-from meeting_subtitles.client import (  # noqa: E402
+from meeting_subtitles.client import Snapshot, TranscriptionClient  # noqa: E402
+from meeting_subtitles.engine_status import (  # noqa: E402
     EngineTooOld,
-    Snapshot,
-    TranscriptionClient,
     engine_status_url,
     fetch_engine_status,
 )

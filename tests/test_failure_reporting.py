@@ -13,7 +13,7 @@ import threading
 import pytest
 
 from meeting_subtitles import serve
-from meeting_subtitles.client import (
+from meeting_subtitles.engine_status import (
     EngineTooOld,
     engine_status_url,
     fetch_engine_status,

@@ -22,10 +22,9 @@ from urllib.parse import urlparse
 
 from meeting_subtitles import audio, paths
 from meeting_subtitles import domain as domains
-from meeting_subtitles.client import (
+from meeting_subtitles.client import Snapshot, TranscriptionClient
+from meeting_subtitles.engine_status import (
     EngineTooOld,
-    Snapshot,
-    TranscriptionClient,
     engine_status_url,
     fetch_engine_status,
 )
