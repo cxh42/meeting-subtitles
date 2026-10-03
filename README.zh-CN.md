@@ -23,7 +23,7 @@
 |---|---|
 | 系统 | Linux，使用 PulseAudio 或 PipeWire 的 PulseAudio 兼容服务；已在 Ubuntu 24.04 / GNOME 上测试 |
 | 桌面 | X11，或通过 XWayland 运行的 Wayland 桌面 |
-| 显卡 | 默认配置面向 NVIDIA CUDA 显卡；开启整句润色约需 22 GB 显存，关闭后约 14 GB |
+| 显卡 | 默认配置面向 NVIDIA CUDA 显卡；开启整句润色约需 25 GB 显存（润色模型只在给引擎留足长时间讲话所需的余量时才加载），关闭后约 15 GB |
 | 磁盘 | 默认模型缓存约 18–20 GB，另需为 Python 依赖和会议录音预留空间 |
 | Python | 3.11 及以上，需安装系统 Tk 和中文字体 |
 

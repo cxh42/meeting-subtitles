@@ -39,7 +39,7 @@ translation. A local Qwen3-4B model then refines completed sentences.
 | Component | Requirement |
 | --- | --- |
 | System | Linux with PulseAudio or PipeWire's PulseAudio compatibility service. Tested on Ubuntu 24.04 with GNOME and XWayland. |
-| GPU | NVIDIA with CUDA support. The default models use roughly 22 GB of VRAM with sentence refinement, or 14 GB without it. These are reference estimates, not fixed requirements. |
+| GPU | NVIDIA with CUDA support. The default models use roughly 25 GB of VRAM with sentence refinement (the refiner only loads when it leaves room for the engine to grow during long speech), or 15 GB without it. These are reference estimates, not fixed requirements. |
 | Storage | Roughly 18–20 GB for the default model cache, plus space for dependencies and meeting recordings. |
 | Python | Python 3.11 or later, with Tk and a CJK font. |
 

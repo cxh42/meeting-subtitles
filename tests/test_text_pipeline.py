@@ -18,6 +18,7 @@ import pytest
 
 from meeting_subtitles import domain, watchdog
 from meeting_subtitles.cleanup import strip_non_speech
+from meeting_subtitles.model import SILENCE_SPEAKER, Line, Snapshot
 from meeting_subtitles.segment import (
     MAX_SENTENCE_CHARS,
     format_time,
@@ -194,3 +195,67 @@ def test_speech_level_tolerates_an_odd_trailing_byte():
     assert watchdog.speech_level(_pcm(3000, 0.1) + b"\x01") > 0
     assert watchdog.speech_level(b"") == 0.0
     assert watchdog.speech_level(b"\x01") == 0.0
+
+
+_SPOKEN = Line(speaker=1, text="We have already finished most of it.",
+               start="0:02:00.00", end="0:02:19.34")
+
+
+def test_a_silence_line_is_not_new_text():
+    """The server appends silence lines on its own clock, dead ASR or not.
+
+    In the meeting that prompted this, a pause added one while the recogniser
+    was failing every chunk, and the stall count started over.
+    """
+    silence = Line(speaker=SILENCE_SPEAKER, text="", start="0:03:11.88", end="0:03:13.24")
+    before = Snapshot(lines=[_SPOKEN])
+    after = Snapshot(lines=[_SPOKEN, silence])
+    assert watchdog.transcript_signature(before) == watchdog.transcript_signature(after)
+
+
+def test_translation_catching_up_is_not_recognition():
+    before = Snapshot(lines=[_SPOKEN], buffer_translation="我们已经")
+    after = Snapshot(lines=[_SPOKEN], buffer_translation="我们已经完成了大部分")
+    assert watchdog.transcript_signature(before) == watchdog.transcript_signature(after)
+
+
+def test_a_growing_partial_sentence_is_progress():
+    before = Snapshot(lines=[_SPOKEN], buffer_transcription="So since")
+    after = Snapshot(lines=[_SPOKEN], buffer_transcription="So since the")
+    assert watchdog.transcript_signature(before) != watchdog.transcript_signature(after)
+
+
+# ----------------------------------------------------- system audio vs mic
+
+def test_speech_only_on_the_microphone_is_flagged_once():
+    watch = watchdog.SystemAudioWatch(unheard_seconds=10)
+    edges = [watch.note(_pcm(0, 0.1), _pcm(3000, 0.1)) for _ in range(300)]
+    assert edges.count("unheard") == 1
+
+
+def test_faint_system_audio_counts_as_missing():
+    """About -55 dBFS: where the other side sat in the meeting that prompted
+    this, too faint for the engine to transcribe."""
+    watch = watchdog.SystemAudioWatch(unheard_seconds=10)
+    edges = [watch.note(_pcm(50, 0.1), _pcm(3000, 0.1)) for _ in range(120)]
+    assert "unheard" in edges
+
+
+def test_sound_from_the_computer_clears_it():
+    watch = watchdog.SystemAudioWatch(unheard_seconds=10)
+    for _ in range(120):
+        watch.note(_pcm(0, 0.1), _pcm(3000, 0.1))
+    edges = [watch.note(_pcm(3000, 0.1), _pcm(0, 0.1)) for _ in range(20)]
+    assert edges.count("heard") == 1
+    assert not watch.reported and watch.mic_seconds == 0
+
+
+def test_a_call_heard_through_the_computer_never_warns():
+    watch = watchdog.SystemAudioWatch(unheard_seconds=10)
+    for _ in range(10):
+        for _ in range(20):        # the other side, 2 s
+            assert watch.note(_pcm(3000, 0.1), _pcm(0, 0.1)) is None
+        for _ in range(80):        # the user, 8 s
+            assert watch.note(_pcm(0, 0.1), _pcm(3000, 0.1)) is None
+    assert watch.total_system_seconds == pytest.approx(20)
+    assert watch.total_mic_seconds == pytest.approx(80)

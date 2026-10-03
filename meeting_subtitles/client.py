@@ -11,15 +11,49 @@ import json
 import logging
 from collections.abc import Callable
 from typing import Any
-from urllib.parse import urlencode
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode, urlparse
+from urllib.request import ProxyHandler, build_opener
 
 import websockets
 
 from meeting_subtitles.model import SILENCE_SPEAKER, Line, Snapshot
+from meeting_subtitles.serve import BACKEND_STATUS_PATH
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["SILENCE_SPEAKER", "Line", "Snapshot", "TranscriptionClient"]
+__all__ = ["SILENCE_SPEAKER", "EngineTooOld", "Line", "Snapshot", "TranscriptionClient",
+           "engine_status_url", "fetch_engine_status"]
+
+
+class EngineTooOld(Exception):
+    """The engine predates the failure report: it has no status route."""
+
+
+def engine_status_url(server: str) -> str:
+    """The status route on the same server as the ``ws://`` address."""
+    parsed = urlparse(server)
+    scheme = "https" if parsed.scheme == "wss" else "http"
+    return f"{scheme}://{parsed.netloc}{BACKEND_STATUS_PATH}"
+
+
+def fetch_engine_status(url: str) -> dict | None:
+    """The engine's backend failure counters, or None when unreachable.
+
+    Bypasses any configured proxy, as doctor's health check does: urllib would
+    otherwise send 127.0.0.1 through the SOCKS proxy the desktop exports.
+    """
+    opener = build_opener(ProxyHandler({}))
+    try:
+        with opener.open(url, timeout=2) as response:
+            status = json.loads(response.read().decode("utf-8"))
+    except HTTPError as exc:
+        if exc.code == 404:
+            raise EngineTooOld from exc
+        return None
+    except (URLError, OSError, ValueError):
+        return None
+    return status if isinstance(status, dict) else None
 
 
 class TranscriptionClient:

@@ -22,16 +22,37 @@ from urllib.parse import urlparse
 
 from meeting_subtitles import audio, paths
 from meeting_subtitles import domain as domains
-from meeting_subtitles.client import Snapshot, TranscriptionClient
+from meeting_subtitles.client import (
+    EngineTooOld,
+    Snapshot,
+    TranscriptionClient,
+    engine_status_url,
+    fetch_engine_status,
+)
 from meeting_subtitles.envfix import normalize_proxy_env
 from meeting_subtitles.overlay import SubtitleOverlay
 from meeting_subtitles.recorder import TranscriptRecorder
 from meeting_subtitles.refine import DEFAULT_MODEL, RefinementMerger, TranslationRefiner
 from meeting_subtitles.segment import resegment
 from meeting_subtitles.tkfix import ensure_cjk_tk
-from meeting_subtitles.watchdog import StallWatchdog
+from meeting_subtitles.watchdog import (
+    BackendWatch,
+    StallWatchdog,
+    SystemAudioWatch,
+    transcript_signature,
+)
 
 logger = logging.getLogger("meeting")
+
+#: How often the engine's failure counters are read. A failing backend raises
+#: many times a second, so two seconds is plenty to see a streak.
+ENGINE_POLL_SECONDS = 2.0
+
+UNHEARD_NOTICE = (
+    "这台电脑没有在播放其他参会者的声音，字幕只能从麦克风里听到他们。\n"
+    "在这台电脑上加入会议音频、打开扬声器（耳机或音箱都行），并把 Zoom 的音量调高；"
+    "如果对方一直没说话，可以忽略这条提示。"
+)
 
 
 def parse_args(argv=None) -> argparse.Namespace:
@@ -92,11 +113,20 @@ def parse_args(argv=None) -> argparse.Namespace:
 
 
 def resolve_sources(args: argparse.Namespace):
-    """Pick the monitor/mic source names, honouring the --no-* switches."""
+    """Pick the monitor/mic source names, honouring the --no-* switches.
+
+    Returns ``(monitor, mic, route)``; ``route`` says why that monitor was
+    chosen, and is None when the user named it (or turned it off), in which
+    case nothing may move it later either.
+    """
     monitor = None
     mic = None
+    route = None
     if not args.no_system:
-        monitor = args.monitor_source or audio.default_monitor_source()
+        if args.monitor_source:
+            monitor = args.monitor_source
+        else:
+            monitor, route = audio.meeting_monitor_source()
     if not args.no_mic:
         mic = args.mic_source or audio.default_mic_source()
         if monitor and mic == monitor:
@@ -106,7 +136,7 @@ def resolve_sources(args: argparse.Namespace):
             mic = None
     if not monitor and not mic:
         raise ValueError("--no-mic 和 --no-system 不能同时使用。")
-    return monitor, mic
+    return monitor, mic, route
 
 
 def make_session_dir(root: str, title: str | None) -> Path:
@@ -123,18 +153,24 @@ class MeetingRunner:
     def __init__(self, args: argparse.Namespace, recorder: TranscriptRecorder,
                  monitor: str | None, mic: str | None,
                  overlay: SubtitleOverlay | None,
-                 merger: RefinementMerger | None = None) -> None:
+                 merger: RefinementMerger | None = None,
+                 follow_route: bool = False) -> None:
         self.args = args
         self.recorder = recorder
         self.merger = merger
         self.monitor = monitor
         self.mic = mic
         self.overlay = overlay
+        #: Move the system-audio capture to wherever the meeting plays; off
+        #: when the user named the monitor themselves.
+        self.follow_route = follow_route
         self.stop_event: asyncio.Event | None = None
         self.loop: asyncio.AbstractEventLoop | None = None
         self.error: BaseException | None = None
         self._last_snapshot: Snapshot | None = None
         self.watchdog = StallWatchdog()
+        self.system_watch = SystemAudioWatch()
+        self._route_clear: asyncio.TimerHandle | None = None
 
     def request_stop(self) -> None:
         """Safe to call from any thread (the Tk thread does).
@@ -152,22 +188,13 @@ class MeetingRunner:
             # The loop closed between the check above and this call.
             pass
 
-    @staticmethod
-    def _signature(snapshot: Snapshot) -> str:
-        """Everything the server can still revise, as one comparable string.
-
-        The buffers belong in it: a working engine keeps rewriting the partial
-        sentence even before it commits a line, so they are the earliest sign
-        that recognition is still alive.
-        """
-        parts = [line.text for line in snapshot.lines]
-        parts.append(snapshot.buffer_transcription)
-        parts.append(snapshot.buffer_translation)
-        return "\x1f".join(parts)
+    @property
+    def refiner(self) -> TranslationRefiner | None:
+        return self.merger.refiner if self.merger is not None else None
 
     def _on_snapshot(self, snapshot: Snapshot) -> None:
         was_stalled = self.watchdog.reported
-        self.watchdog.note_text(self._signature(snapshot))
+        self.watchdog.note_text(transcript_signature(snapshot))
         if was_stalled and not self.watchdog.reported:
             # Text is moving again; leaving the warning up would be a lie.
             logger.info("识别已恢复。")
@@ -190,14 +217,104 @@ class MeetingRunner:
             self.overlay.set_status(status)
 
     def _report_stall(self) -> None:
-        """Say so, loudly, rather than letting the meeting look fine."""
-        message = ("识别已停止：还在收音，但引擎超过 "
-                   f"{int(self.watchdog.stall_seconds)} 秒没有产出新文本。\n"
-                   "多半是显存被别的程序占满了。结束本场会议，用 nvidia-smi "
-                   "看看是谁，然后在启动器里重启引擎。")
+        """Say so, loudly, rather than letting the meeting look fine.
+
+        The fallback for an engine that stops without raising, or one too old
+        to report its failures; :meth:`_on_engine_failing` is usually first.
+        It does not unload the refiner: speech-level audio that yields no text
+        can also be music, and the polish should not go for that.
+        """
+        message = ("识别停止了：还在收音，但 "
+                   f"{int(self.watchdog.stall_seconds)} 秒的语音没有产出文字。\n"
+                   "多半是显存被占满了：用 nvidia-smi 看是谁占着并关掉它，识别会自己恢复；"
+                   "仍不恢复就结束会议，在启动器里重启引擎。")
         logger.error("%s", message.replace("\n", " "))
         if self.overlay:
             self.overlay.set_notice(message, key="stall")
+
+    def _on_engine_failing(self, watch: BackendWatch) -> None:
+        """The engine is failing every chunk: free what we can, and say why.
+
+        The recogniser recovers by itself on the next chunk once memory is
+        available, so when the failure is out-of-memory the refiner's model
+        goes -- the polish is worth less than the transcript.
+        """
+        refiner = self.refiner
+        if watch.out_of_memory:
+            if refiner is not None and refiner.release("识别引擎显存不足，润色模型让出了显存"):
+                message = ("识别引擎显存不足，已自动关闭整句润色，把显存让给识别，字幕应在几秒内恢复。\n"
+                           "以后显存紧张时，开会前在启动器里关掉「整句润色」。")
+            else:
+                message = ("识别引擎显存不足，字幕暂停了。\n"
+                           "用 nvidia-smi 看是谁占着显存并关掉它，字幕会自动恢复，不用重启。")
+        else:
+            message = (f"识别引擎出错，字幕暂停了：{watch.last_error[:120]}\n"
+                       f"运行 meeting-subtitles-doctor 检查；引擎日志在 {paths.server_log()}")
+        logger.error("%s", message.replace("\n", " "))
+        if self.overlay:
+            self.overlay.set_notice(message, key="engine")
+
+    def _on_engine_recovered(self) -> None:
+        logger.warning("识别引擎已恢复。")
+        if self.overlay:
+            self.overlay.set_notice("", key="engine")
+            refiner = self.refiner
+            if refiner is not None and refiner.released:
+                self.overlay.set_notice("整句润色已在会议中途关闭，显存让给了识别。", key="refine")
+
+    async def _watch_engine(self) -> None:
+        """Read the engine's failure counters; see :class:`BackendWatch`."""
+        url = engine_status_url(self.args.server)
+        watch = BackendWatch()
+        while True:
+            try:
+                status = await asyncio.to_thread(fetch_engine_status, url)
+            except EngineTooOld:
+                logger.warning("引擎是旧版本，不报告识别故障；在启动器里重启一次引擎即可启用。")
+                return
+            if status is not None:
+                try:
+                    edge = watch.update(int(status.get("failures", 0)),
+                                        int(status.get("out_of_memory", 0)),
+                                        str(status.get("last_error", "")))
+                except (TypeError, ValueError):
+                    edge = None
+                if edge == "failing":
+                    self._on_engine_failing(watch)
+                elif edge == "recovered":
+                    self._on_engine_recovered()
+            await asyncio.sleep(ENGINE_POLL_SECONDS)
+
+    def _note_branches(self, system: bytes, mic: bytes) -> None:
+        edge = self.system_watch.note(system, mic)
+        if edge == "unheard":
+            logger.warning("%s", UNHEARD_NOTICE.replace("\n", " "))
+            if self.overlay:
+                self.overlay.set_notice(UNHEARD_NOTICE, key="unheard")
+        elif edge == "heard":
+            logger.warning("系统声音里又有声音了。")
+            if self.overlay:
+                self.overlay.set_notice("", key="unheard")
+
+    def _route_changed(self, sink: audio.Sink, reason: str) -> None:
+        """Called from the router's thread when it moves the capture."""
+        loop = self.loop
+        if loop is None or loop.is_closed() or not self.overlay:
+            return
+        try:
+            loop.call_soon_threadsafe(self._show_route, sink, reason)
+        except RuntimeError:
+            pass    # the loop closed in between; the meeting is over anyway
+
+    def _show_route(self, sink: audio.Sink, reason: str) -> None:
+        overlay = self.overlay
+        if overlay is None:
+            return
+        overlay.set_notice(f"系统声音改为录「{sink.description}」：{reason}", key="route")
+        if self._route_clear is not None:
+            self._route_clear.cancel()
+        self._route_clear = asyncio.get_running_loop().call_later(
+            10, lambda: overlay.set_notice("", key="route"))
 
     async def _run(self) -> None:
         self.loop = asyncio.get_running_loop()
@@ -237,14 +354,25 @@ class MeetingRunner:
                             chunk = next_task.result()
                         except StopAsyncIteration:
                             return
-                        self.watchdog.note_audio(chunk)
+                        self.watchdog.note_audio(chunk.pcm)
                         if self.watchdog.take_report():
                             self._report_stall()
-                        yield chunk
+                        if chunk.system is not None and chunk.mic is not None:
+                            self._note_branches(chunk.system, chunk.mic)
+                        yield chunk.pcm
                 finally:
                     stop_task.cancel()
 
-            await client.run(pcm_source(), self._on_snapshot, self._on_status)
+            helpers = [asyncio.create_task(self._watch_engine())]
+            if self.follow_route and capture.process is not None:
+                router = audio.MeetingAudioRouter(capture.process.pid, self._route_changed)
+                helpers.append(asyncio.create_task(router.run()))
+            try:
+                await client.run(pcm_source(), self._on_snapshot, self._on_status)
+            finally:
+                for task in helpers:
+                    task.cancel()
+                await asyncio.gather(*helpers, return_exceptions=True)
 
     def run_forever(self) -> None:
         try:
@@ -276,11 +404,19 @@ def main(argv=None) -> int:
         for source in audio.list_sources():
             print(f"  {source}")
         try:
-            print(f"\n默认系统声音: {audio.default_monitor_source()}")
-            print(f"默认麦克风  : {audio.default_mic_source()}")
+            monitor, route = audio.meeting_monitor_source()
+            print(f"\n系统声音: {monitor}（{route}）")
+            print(f"默认麦克风: {audio.default_mic_source()}")
         except RuntimeError as exc:
             print(f"\n{exc}", file=sys.stderr)
             return 2
+        sinks = {sink.index: sink for sink in audio.list_sinks()}
+        for stream in audio.playback_streams():
+            if stream.is_zoom:
+                sink = sinks.get(stream.sink)
+                where = sink.description if sink else f"#{stream.sink}"
+                state = "静音" if stream.muted else f"音量 {stream.volume}%"
+                print(f"Zoom 正在播放到: {where}（{state}）")
         return 0
 
     parsed = urlparse(args.server)
@@ -289,11 +425,11 @@ def main(argv=None) -> int:
         return 2
 
     try:
-        monitor, mic = resolve_sources(args)
+        monitor, mic, route = resolve_sources(args)
     except (RuntimeError, ValueError) as exc:
         print(f"错误: {exc}", file=sys.stderr)
         return 2
-    print(f"系统声音: {monitor or '(关闭)'}")
+    print(f"系统声音: {monitor or '(关闭)'}" + (f"（{route}）" if route else ""))
     print(f"麦克风  : {mic or '(关闭)'}")
 
     if args.session_dir:
@@ -330,7 +466,8 @@ def main(argv=None) -> int:
     merger = RefinementMerger(refiner)
 
     overlay: SubtitleOverlay | None = None
-    runner = MeetingRunner(args, recorder, monitor, mic, overlay=None, merger=merger)
+    runner = MeetingRunner(args, recorder, monitor, mic, overlay=None, merger=merger,
+                           follow_route=route is not None)
 
     if not args.no_overlay:
         try:
@@ -393,7 +530,9 @@ def main(argv=None) -> int:
         if runner._last_snapshot is not None:
             merger.flush_last(runner._last_snapshot)
         deadline = time.monotonic() + 20
-        while not refiner.queue.empty() and time.monotonic() < deadline:
+        # A released refiner has no worker left to drain its queue.
+        while (not refiner.queue.empty() and not refiner.released
+               and time.monotonic() < deadline):
             time.sleep(0.3)
         time.sleep(0.5)
         if runner._last_snapshot is not None:
@@ -403,8 +542,16 @@ def main(argv=None) -> int:
                   f"平均 {refiner.average_seconds:.2f} 秒/句")
         elif refiner.failed:
             print(f"整句润色未生效: {refiner.failed}")
+        if refiner.released:
+            print(f"整句润色在会议中途关闭: {refiner.released}")
         refiner.stop(timeout=5)
 
+    watch = runner.system_watch
+    if watch.total_mic_seconds or watch.total_system_seconds:
+        # One line in the journal that answers "was the other side even
+        # reaching us?" after the fact, without digging through the wav.
+        print(f"有声音的时长：电脑播放 {watch.total_system_seconds:.0f} 秒，"
+              f"麦克风 {watch.total_mic_seconds:.0f} 秒")
     print(recorder.close())
     if runner.error is not None:
         return 1

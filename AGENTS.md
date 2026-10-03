@@ -80,13 +80,20 @@ Each of these failed silently or blamed the wrong thing. All are current.
 - **A CUDA OOM in the ASR looks exactly like a healthy meeting.** The server
   catches the backend exception per chunk and carries on, so the WebSocket
   stays open, snapshots keep arriving and the transcript file stays readable --
-  it just never gains another word. The cause is usually the refiner: it is a
-  *separate process* on the same card, so its 9 GB does not fail in the process
-  that asked for it, it fails in whichever allocates next. `refine.py` checks
-  `torch.cuda.mem_get_info()` before loading, and `watchdog.py` warns when
-  speech keeps going in with no text coming back. Elapsed time cannot be the
-  trigger -- a pause is indistinguishable from a dead backend -- so only
-  seconds of audio above a speech threshold count.
+  it just never gains another word. What fills the card is mostly the engine
+  itself: with PyTorch's default allocator its decoder cache grew 11 GB in two
+  minutes of pause-free speech, and CTranslate2 hands the encoder's working
+  memory back to the driver after every call, so the encoder is what fails.
+  `serve.py` sets `expandable_segments` and a CT2 pool threshold, counts the
+  swallowed exceptions and serves them on `/meeting-subtitles/backend`; the
+  meeting unloads the refiner when they are out-of-memory, and the engine
+  recovers by itself (after one stale `invalid device ordinal`).
+- **Capturing `<default sink>.monitor` follows the default, it is not pinned.**
+  WirePlumber treats a target equal to the default as "follow the default", so
+  Zoom's "share computer sound" switch to its `zoomcombine` sink took the
+  capture with it while Zoom's own voices stayed on the real device: the
+  system audio went silent and only the microphone was subtitled.
+  `audio.MeetingAudioRouter` follows Zoom's sink-input instead.
 - **Two processes, one settings file, last writer wins.** The launcher stays
   alive behind the overlay with its own copy of the settings, so an adjustment
   made in the overlay was overwritten by the launcher's stale sliders the

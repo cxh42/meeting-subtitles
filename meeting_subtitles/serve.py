@@ -26,12 +26,35 @@ on this machine:
 """
 
 import argparse
+import ctypes
 import json
+import logging
 import os
+import subprocess
 import sys
+import threading
+import time
+from collections.abc import Callable
 from pathlib import Path
 
 from meeting_subtitles import paths
+
+logger = logging.getLogger(__name__)
+
+#: Where the engine reports the backend failures it otherwise swallows. The
+#: meeting process polls it; see :class:`BackendFailures`.
+BACKEND_STATUS_PATH = "/meeting-subtitles/backend"
+
+#: Freed memory CTranslate2's CUDA pool may keep rather than hand back to the
+#: driver. Its whole working set is the large-v3 encoder's ~140 MB per 30 s
+#: window; the cap only bounds the unforeseen.
+CT2_POOL_KEEP_BYTES = 1 << 30
+
+_CU_MEMPOOL_ATTR_RELEASE_THRESHOLD = 4
+
+#: A failure after this much quiet starts a new streak, which is when the
+#: GPU's state is worth writing down.
+_STREAK_GAP_SECONDS = 10.0
 
 DEFAULTS = {
     "MODEL": "large-v3",
@@ -46,6 +69,24 @@ DEFAULTS = {
 }
 
 PROXY_VARS = ("http_proxy", "https_proxy", "all_proxy", "no_proxy")
+
+
+def configure_allocator() -> None:
+    """Stop the engine's PyTorch cache from ballooning during long speech.
+
+    SimulStreaming re-runs the decoder over a prompt that grows token by token,
+    so every call asks for slightly larger blocks than the last, and PyTorch's
+    default allocator cannot reuse the old ones: it caches them and asks the
+    driver for more. Measured on two minutes of pause-free speech, the engine
+    grew from 11.3 GB to 22.6 GB; with expandable segments it peaked at
+    14.3 GB with the same transcript. The cache is only emptied after a pause
+    of 5 s or more, so a long monologue next to the 8 GB refiner filled the
+    32 GB card -- the out-of-memory that stopped a meeting at 2:19.
+
+    ``setdefault``: an explicit setting in the environment wins. Must run before
+    torch is imported, which reads it once.
+    """
+    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 
 def apply_env_file() -> None:
@@ -154,6 +195,164 @@ def configure_hub(model: str, target_language: str, nllb_size: str) -> bool:
     return True
 
 
+def keep_ct2_working_set(keep: int = CT2_POOL_KEEP_BYTES) -> str | None:
+    """Make CTranslate2 keep the encoder's working memory between calls.
+
+    CTranslate2 allocates through CUDA's stream-ordered pool and leaves its
+    release threshold at zero, so every encoder call borrows its working set
+    from the driver and hands it back at the next synchronisation. Anything
+    else on the card can take it in between -- the refiner, the engine's own
+    PyTorch cache, a video call -- and the next encode then fails with
+    out-of-memory on every chunk for as long as the other allocation lives,
+    each failure swallowed by the server. Measured on large-v3: with the
+    threshold raised the process keeps its ~140 MB working set after the
+    first encode (the warm-up); without it, it drops back to its weights after
+    every call. The encoder always runs on a padded 30 s window, so the
+    warm-up's working set is the largest it will ever need.
+
+    Returns what went wrong, or None. Nothing here may stop the engine: the
+    default behaviour is only less robust.
+    """
+    try:
+        cuda = ctypes.CDLL("libcuda.so.1")
+    except OSError:
+        return None   # no NVIDIA driver, so nothing runs on CUDA
+    try:
+        cuda.cuDeviceGetDefaultMemPool.argtypes = [ctypes.POINTER(ctypes.c_void_p),
+                                                   ctypes.c_int]
+        cuda.cuMemPoolSetAttribute.argtypes = [ctypes.c_void_p, ctypes.c_int,
+                                               ctypes.c_void_p]
+    except AttributeError:
+        return "显卡驱动太旧，不支持显存池（不影响启动）"
+    count = ctypes.c_int()
+    if cuda.cuInit(0) != 0 or cuda.cuDeviceGetCount(ctypes.byref(count)) != 0:
+        return "CUDA 驱动初始化失败，跳过显存池设置（不影响启动）"
+    value = ctypes.c_uint64(keep)
+    for ordinal in range(count.value):
+        device = ctypes.c_int()
+        pool = ctypes.c_void_p()
+        if (cuda.cuDeviceGet(ctypes.byref(device), ordinal) != 0
+                or cuda.cuDeviceGetDefaultMemPool(ctypes.byref(pool), device) != 0
+                or cuda.cuMemPoolSetAttribute(pool, _CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
+                                              ctypes.byref(value)) != 0):
+            return (f"无法设置第 {ordinal} 块显卡的显存池（不影响启动，"
+                    "只是识别更容易被别的程序挤掉显存）")
+    return None
+
+
+def is_out_of_memory(text: str) -> bool:
+    """CTranslate2, PyTorch, cuBLAS and cuDNN each word it differently."""
+    lowered = text.lower()
+    return ("out of memory" in lowered or "alloc_failed" in lowered
+            or "memoryallocation" in lowered)
+
+
+def _log_gpu_memory(error: str) -> None:
+    """Write down who holds the card, at the moment the ASR started failing.
+
+    The investigation that led here had to reconstruct this after the fact
+    and never could. Runs on its own thread: the failing backend thread
+    should not wait for nvidia-smi, and CTranslate2 leaves a stale CUDA error
+    on that thread which a CUDA call of ours could trip over.
+    """
+    lines = [f"识别后端开始出错: {error}"]
+    torch = sys.modules.get("torch")
+    try:
+        if torch is not None and torch.cuda.is_available():
+            free, total = torch.cuda.mem_get_info()
+            mib = 1024 ** 2
+            lines.append(f"显存空闲 {free // mib} MiB / 共 {total // mib} MiB，"
+                         f"引擎 PyTorch 缓存 {torch.cuda.memory_reserved() // mib} MiB")
+    except Exception as exc:
+        lines.append(f"读取显存失败: {exc}")
+    try:
+        apps = subprocess.run(
+            ["nvidia-smi", "--query-compute-apps=pid,process_name,used_memory",
+             "--format=csv,noheader"], capture_output=True, text=True, timeout=10,
+        ).stdout.strip()
+        if apps:
+            lines.append("占用显存的进程:\n" + apps)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    logger.error("\n".join(lines))
+
+
+def _report_gpu_memory(error: str) -> None:
+    threading.Thread(target=_log_gpu_memory, args=(error,),
+                     name="gpu-memory-report", daemon=True).start()
+
+
+class BackendFailures(logging.Handler):
+    """Counts the exceptions WhisperLiveKit logs and then swallows.
+
+    The backend catches whatever a chunk raises, logs it with its traceback
+    and returns no words, and the server never tells the client: its status
+    stays "active_transcription" while the ASR fails every chunk. The log is
+    the only place a dead recogniser shows, so this sits on the log and
+    counts. Only records with an exception attached count; the server's own
+    "no output after N s" alarm has none, and it fires on a long opening
+    silence rather than on a failure.
+    """
+
+    def __init__(self, on_streak: Callable[[str], None] | None = None,
+                 streak_gap: float = _STREAK_GAP_SECONDS) -> None:
+        super().__init__(level=logging.ERROR)
+        self.failures = 0
+        self.out_of_memory = 0
+        self.last_error = ""
+        #: Called with the error that starts each streak of failures.
+        self.on_streak = on_streak if on_streak is not None else _report_gpu_memory
+        self.streak_gap = streak_gap
+        self._last_at = float("-inf")
+
+    def emit(self, record: logging.LogRecord) -> None:
+        error = record.exc_info[1] if record.exc_info else None
+        if error is None:
+            return
+        text = f"{type(error).__name__}: {error}"[:300]
+        self.failures += 1
+        if is_out_of_memory(text):
+            self.out_of_memory += 1
+        self.last_error = text
+        now = time.monotonic()
+        if now - self._last_at > self.streak_gap:
+            self.on_streak(text)
+        self._last_at = now
+
+    def snapshot(self) -> dict:
+        self.acquire()
+        try:
+            return {"failures": self.failures, "out_of_memory": self.out_of_memory,
+                    "last_error": self.last_error}
+        finally:
+            self.release()
+
+
+class _SkipStatusPolls(logging.Filter):
+    """A meeting polls the status route every two seconds; an access-log line
+    per poll would bury everything else in the engine log."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return BACKEND_STATUS_PATH not in record.getMessage()
+
+
+def report_backend_failures(app) -> BackendFailures:
+    """Count backend exceptions and serve the counts on the status route."""
+    from fastapi.responses import JSONResponse
+
+    failures = BackendFailures()
+    logging.getLogger("whisperlivekit").addHandler(failures)
+    # A filter on the logger itself survives uvicorn's dictConfig, which only
+    # replaces handlers.
+    logging.getLogger("uvicorn.access").addFilter(_SkipStatusPolls())
+
+    async def backend_status() -> JSONResponse:
+        return JSONResponse(failures.snapshot())
+
+    app.add_api_route(BACKEND_STATUS_PATH, backend_status, methods=["GET"])
+    return failures
+
+
 def parse_args(argv=None) -> argparse.Namespace:
     def env(key: str) -> str:
         return os.environ.get(key, DEFAULTS[key])
@@ -200,6 +399,7 @@ def build_argv(args: argparse.Namespace) -> list[str]:
 
 def main(argv: list[str] | None = None) -> int:
     apply_env_file()
+    configure_allocator()
     normalise_proxies()
     args = parse_args(argv)
     offline = configure_hub(args.model, args.target_language, args.nllb_size)
@@ -227,11 +427,21 @@ def main(argv: list[str] | None = None) -> int:
         print(f"代理: {proxies or '(已清除)'}")
         return 0
 
+    # First basicConfig call wins, which makes the server's own a no-op. The
+    # times are for the next post-mortem: without them, working out when a
+    # meeting broke meant re-running the VAD over its recording.
+    logging.basicConfig(format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
+                        datefmt="%H:%M:%S")
+    problem = keep_ct2_working_set()
+    if problem:
+        print(f"警告: {problem}", flush=True)
+
     # Imported only now: the environment above has to be final before
     # huggingface_hub and transformers read it at *their* import time.
     sys.argv = server_argv
-    from whisperlivekit.basic_server import main as serve
-    serve()
+    from whisperlivekit import basic_server
+    report_backend_failures(basic_server.app)
+    basic_server.main()
     return 0
 
 

@@ -15,9 +15,11 @@ The model loads in a background thread so a meeting can start immediately;
 refinement simply begins working a few sentences in.
 """
 
+import gc
 import logging
 import os
 import queue
+import sys
 import threading
 import time
 
@@ -43,6 +45,13 @@ _WEIGHT_SUFFIXES = (".safetensors", ".bin", ".pt")
 #: and enough slack that a transient allocation does not tip the card over.
 _VRAM_HEADROOM = 1.0 * 1024 ** 3
 _VRAM_OVERHEAD = 1.15
+
+#: Left free for everything that grows *after* the refiner loads. The check
+#: runs once, at the start of the meeting, when the engine is at its smallest:
+#: two minutes of pause-free speech grow it by 3.2 GB even with the allocator
+#: setting in serve.py (11.3 GB without), and a video call starting in Zoom or
+#: the browser wants its share too.
+_VRAM_RESERVE = 4.0 * 1024 ** 3
 
 
 def repo_dir(model_id: str) -> str:
@@ -148,6 +157,9 @@ class TranslationRefiner:
         self._tokenizer = None
         self.ready = threading.Event()
         self.failed: str | None = None
+        #: Why the model was unloaded mid-meeting, once :meth:`release` ran.
+        self.released: str | None = None
+        self._release = threading.Event()
         self.stats = {"count": 0, "total_seconds": 0.0}
 
     # ------------------------------------------------------------- lifecycle
@@ -177,6 +189,40 @@ class TranslationRefiner:
         self._model = None
         self._tokenizer = None
 
+    def release(self, reason: str) -> bool:
+        """Unload the model mid-meeting so the recogniser can have the memory.
+
+        The polish is the expendable half of a meeting. When the engine runs
+        out of memory it fails every chunk until something on the card lets
+        go, and recovers by itself on the next chunk once something does --
+        so giving back these ~8 GB turns a dead transcript into a working one
+        without a restart. The worker does the unloading, between sentences,
+        because it is the thread using the model.
+
+        Returns whether there was a model to give back.
+        """
+        if self._release.is_set() or self.failed or self._worker is None:
+            return False
+        self.released = reason
+        self._release.set()
+        try:
+            self.queue.put_nowait(None)    # wake a worker waiting for work
+        except queue.Full:
+            pass    # a busy worker checks the flag before its next sentence
+        return True
+
+    def _unload(self) -> None:
+        self._model = None
+        self._tokenizer = None
+        torch = sys.modules.get("torch")
+        if torch is None or self.device != "cuda":
+            return   # nothing was ever put on the card
+        # Dropping the references frees nothing the driver can see: PyTorch
+        # keeps the blocks cached for this process until told otherwise.
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     def _require_vram(self, torch) -> None:
         """Refuse to load when the card cannot hold the model.
 
@@ -193,14 +239,19 @@ class TranslationRefiner:
         weights = weights_bytes(self.model_id)
         if not weights:
             return
-        needed = weights * _VRAM_OVERHEAD + _VRAM_HEADROOM
+        needed = weights * _VRAM_OVERHEAD + _VRAM_HEADROOM + _VRAM_RESERVE
         free, total = torch.cuda.mem_get_info()
+        gb = 1024 ** 3
+        # Logged either way: when a meeting later runs out of memory, the
+        # first question is how much was free when the refiner moved in.
+        logger.info("润色模型显存检查：需要 %.1f GB（含给识别预留的 %.1f GB），空闲 %.1f GB / 共 %.1f GB",
+                    needed / gb, _VRAM_RESERVE / gb, free / gb, total / gb)
         if free >= needed:
             return
-        gb = 1024 ** 3
         raise RuntimeError(
-            f"显存不足：润色模型需要约 {needed / gb:.1f} GB，当前空闲 {free / gb:.1f} GB"
-            f"（显卡共 {total / gb:.1f} GB）。\n"
+            f"显存不足：润色模型需要约 {needed / gb:.1f} GB"
+            f"（其中 {_VRAM_RESERVE / gb:.0f} GB 留给会议中途变大的识别引擎），"
+            f"当前空闲 {free / gb:.1f} GB（显卡共 {total / gb:.1f} GB）。\n"
             "先关掉占用显存的其他程序（nvidia-smi 可以看是谁），"
             "或在启动器里关闭「整句润色」。"
         )
@@ -267,13 +318,22 @@ class TranslationRefiner:
         except Exception as exc:
             self.failed = str(exc)
             logger.warning("润色模型加载失败，将只使用流式译文: %s", exc)
+            # A load that died half way leaves its shards in PyTorch's cache,
+            # still counted against the card.
+            self._unload()
             self.ready.set()
             return
         self.ready.set()
+        try:
+            self._serve()
+        finally:
+            self._unload()
 
-        while True:
+    def _serve(self) -> None:
+        # A release requested while the model was still loading lands here.
+        while not self._release.is_set():
             item = self.queue.get()
-            if item is None:
+            if item is None or self._release.is_set():
                 return
             english, previous = item
             try:
@@ -349,7 +409,7 @@ class TranslationRefiner:
     def submit(self, english: str, previous: str | None = None) -> None:
         """Queue a finished sentence. Repeats and blanks are ignored."""
         english = (english or "").strip()
-        if len(english) < 2:
+        if len(english) < 2 or self._release.is_set():
             return
         with self._lock:
             if english in self._submitted:

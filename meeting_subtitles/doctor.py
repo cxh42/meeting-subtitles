@@ -12,6 +12,7 @@ warning and never fail the run.
 """
 
 import importlib.util
+import math
 import os
 import shutil
 import subprocess
@@ -38,9 +39,12 @@ def _pad(text: str, width: int = LABEL_WIDTH) -> str:
 MIN_PYTHON = (3, 11)
 
 #: Measured on this configuration: whisper large-v3 plus its CTranslate2
-#: encoder plus NLLB-1.3B, and Qwen3-4B in bfloat16 with room to generate.
-ENGINE_VRAM_GB = 14
-REFINE_VRAM_GB = 9
+#: encoder plus NLLB-1.3B -- 11.2 GB loaded, 14.3 GB after two minutes of
+#: pause-free speech -- and Qwen3-4B in bfloat16 with room to generate. The
+#: refiner figure is what refine.py demands before loading, which includes
+#: the reserve it leaves for the engine to grow into.
+ENGINE_VRAM_GB = 15
+REFINE_VRAM_GB = 14
 
 
 def _engine_is_up(timeout: float = 2) -> bool:
@@ -118,11 +122,46 @@ def check_audio_server() -> Result:
 def check_monitor_source() -> Result:
     try:
         from meeting_subtitles import audio
-        monitor = audio.default_monitor_source()
+        sink, reason = audio.meeting_sink()
+        default = audio.default_sink_name()
+        sinks = audio.list_sinks()
     except Exception as exc:
         return Result(FAIL, "系统声音源", str(exc)[:70],
                       "确认「设置 → 声音」里选中了一个输出设备。")
-    return Result(OK, "系统声音源", monitor)
+    detail = f"{sink.description}（{reason}）"
+    if any(candidate.name == default and candidate.is_zoom_share for candidate in sinks):
+        return Result(WARN, "系统声音源", detail,
+                      "系统默认输出是 Zoom「共享电脑声音」临时建的虚拟设备。字幕会改录实际的输出设备，\n"
+                      "但别的程序的声音也被转到了那里。在 Zoom 里停止共享声音；Zoom 退出后它还在的话，\n"
+                      "到「设置 → 声音 → 输出」选回实际的耳机或音箱。")
+    return Result(OK, "系统声音源", detail)
+
+
+def check_meeting_playback() -> Result:
+    """Where Zoom plays, and whether what it plays is loud enough to use.
+
+    Zoom's own volume and mute are applied to its stream before the sink's
+    monitor, so a Zoom turned down to suit the speakers is turned down for the
+    transcript too. A hardware sink's volume is applied after the monitor and
+    does not matter.
+    """
+    from meeting_subtitles import audio
+    zoom = [stream for stream in audio.playback_streams() if stream.is_zoom]
+    if not zoom:
+        return Result(OK, "会议声音", "Zoom 现在没有在播放（开会时再运行一次可检查音量和设备）")
+    sinks = {sink.index: sink for sink in audio.list_sinks()}
+    stream = min(zoom, key=lambda candidate: candidate.corked)
+    where = sinks[stream.sink].description if stream.sink in sinks else f"#{stream.sink}"
+    if stream.muted:
+        return Result(WARN, "会议声音", f"Zoom 在「{where}」播放，但已静音",
+                      "取消 Zoom 扬声器的静音。想安静就调系统音量或戴耳机：字幕录的是调系统音量之前的声音。")
+    if stream.volume < 70:
+        # PulseAudio volumes are cubic: 30 % is about -31 dB.
+        loss = -60 * math.log10(max(stream.volume, 1) / 100)
+        return Result(WARN, "会议声音", f"Zoom 在「{where}」播放，音量 {stream.volume}%",
+                      f"送进字幕的对方声音因此小了约 {loss:.0f} dB。把 Zoom 的扬声器音量调到 100%，\n"
+                      "用系统音量或音箱旋钮调听感——系统音量通常不影响字幕。")
+    return Result(OK, "会议声音", f"Zoom 在「{where}」播放，音量 {stream.volume}%")
 
 
 def check_microphone() -> Result:
@@ -365,7 +404,7 @@ CHECKS = (
     ("环境", [check_python, check_engine_package, check_gpu,
               check_ctranslate2_cuda, check_compiler, check_free_vram]),
     ("音频", [check_ffmpeg, check_audio_server, check_monitor_source,
-              check_microphone]),
+              check_meeting_playback, check_microphone]),
     ("界面", [check_display_server, check_tk_fonts, check_rounding]),
     ("运行", [check_models, check_refine_model, check_process_control,
               check_engine_running]),

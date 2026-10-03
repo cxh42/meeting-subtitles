@@ -28,13 +28,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from meeting_subtitles import audio as audio_mod  # noqa: E402
 from meeting_subtitles import domain as domains  # noqa: E402
-from meeting_subtitles.client import Snapshot, TranscriptionClient  # noqa: E402
+from meeting_subtitles.client import (  # noqa: E402
+    EngineTooOld,
+    Snapshot,
+    TranscriptionClient,
+    engine_status_url,
+    fetch_engine_status,
+)
 from meeting_subtitles.refine import (  # noqa: E402
     RefinementMerger,
     TranslationRefiner,
 )
 from meeting_subtitles.segment import resegment  # noqa: E402
-from meeting_subtitles.watchdog import StallWatchdog  # noqa: E402
+from meeting_subtitles.watchdog import StallWatchdog, transcript_signature  # noqa: E402
 
 CHUNK_MS = 100
 
@@ -116,9 +122,7 @@ async def run(args) -> int:
     def on_snapshot(snapshot: Snapshot) -> None:
         nonlocal snapshots, last
         snapshots += 1
-        parts = [line.text for line in snapshot.lines]
-        parts += [snapshot.buffer_transcription, snapshot.buffer_translation]
-        watchdog.note_text("\x1f".join(parts))
+        watchdog.note_text(transcript_signature(snapshot))
         if not args.no_sentence_split:
             snapshot = resegment(snapshot)
         last = merger.process(snapshot)
@@ -153,8 +157,17 @@ async def run(args) -> int:
                 if delay > 0:
                     await asyncio.sleep(delay)
 
+    async def engine_failures() -> dict | None:
+        try:
+            return await asyncio.to_thread(fetch_engine_status,
+                                           engine_status_url(args.server))
+        except EngineTooOld:
+            return None
+
+    before = await engine_failures()
     await client.run(source(), on_snapshot,
                      lambda status: print(f"  状态: {status}", flush=True))
+    after = await engine_failures()
 
     if refiner is not None:
         if last is not None:
@@ -167,6 +180,15 @@ async def run(args) -> int:
             last = merger.process(last)
 
     print(f"\n收到 {snapshots} 个快照，看门狗告警 {stalls} 次")
+    if before is not None and after is not None:
+        # The decisive number when a replay comes back thin: the server
+        # swallows backend exceptions, so they show nowhere else.
+        failed = after.get("failures", 0) - before.get("failures", 0)
+        oom = after.get("out_of_memory", 0) - before.get("out_of_memory", 0)
+        print(f"引擎识别故障 {failed} 次（显存不足 {oom} 次）"
+              + (f"，最后一次: {after.get('last_error')}" if failed else ""))
+    else:
+        print("引擎不报告识别故障（旧版本或连不上状态接口）")
     if refiner is not None:
         if refiner.failed:
             print(f"润色未生效: {refiner.failed}")
