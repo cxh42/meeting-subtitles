@@ -56,6 +56,10 @@ _CU_MEMPOOL_ATTR_RELEASE_THRESHOLD = 4
 #: GPU's state is worth writing down.
 _STREAK_GAP_SECONDS = 10.0
 
+#: Seconds without speech after which the VAD's recurrent state is cleared;
+#: see :func:`keep_vad_listening`.
+VAD_IDLE_RESET_SECONDS = 2.0
+
 DEFAULTS = {
     "MODEL": "large-v3",
     "LANGUAGE": "en",
@@ -238,6 +242,54 @@ def keep_ct2_working_set(keep: int = CT2_POOL_KEEP_BYTES) -> str | None:
             return (f"无法设置第 {ordinal} 块显卡的显存池（不影响启动，"
                     "只是识别更容易被别的程序挤掉显存）")
     return None
+
+
+def keep_vad_listening() -> bool:
+    """Stop the server's voice detector from drifting deaf during a meeting.
+
+    Silero is a recurrent model, and the server feeds one instance a whole
+    meeting without ever resetting it. On faint, distant speech -- a
+    loudspeaker across the room reaching the webcam microphone at -40 dBFS --
+    its state drifts until every frame scores 0.00. Measured on a recorded
+    test: the speech probability sank from 0.7 to exactly zero within a
+    minute, while the same audio scored up to 0.74 with a fresh state and
+    Whisper without any VAD transcribed it cleanly. Whatever the VAD calls
+    silence never reaches the recogniser, so the subtitles simply stop, with
+    nothing failing anywhere. Clearing the state after two seconds without
+    speech found 3.7 times the speech on that recording and changed nothing
+    on close or clean audio, where silent stretches stayed silent.
+
+    Must run after whisperlivekit is imported and before a session starts.
+    Returns False when the server's internals have moved and nothing changed.
+    """
+    from whisperlivekit import audio_processor
+
+    base = getattr(audio_processor, "FixedVADIterator", None)
+    if base is None:
+        return False
+    idle_samples = int(VAD_IDLE_RESET_SECONDS * 16000)
+
+    class SteadyVADIterator(base):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._quiet_samples = 0
+
+        def __call__(self, x, *args, **kwargs):
+            events = super().__call__(x, *args, **kwargs)
+            if self.triggered or events:
+                self._quiet_samples = 0
+            else:
+                self._quiet_samples += len(x)
+                if self._quiet_samples >= idle_samples:
+                    # The model's memory only. reset_states() would also zero
+                    # current_sample, the stream position the server's
+                    # timestamps are built on.
+                    self.model.reset_states()
+                    self._quiet_samples = 0
+            return events
+
+    audio_processor.FixedVADIterator = SteadyVADIterator
+    return True
 
 
 def is_out_of_memory(text: str) -> bool:
@@ -441,6 +493,9 @@ def main(argv: list[str] | None = None) -> int:
     sys.argv = server_argv
     from whisperlivekit import basic_server
     report_backend_failures(basic_server.app)
+    if not keep_vad_listening():
+        print("警告: 语音检测的防失聪修正没有生效（whisperlivekit 内部结构变了），"
+              "声音较小时字幕可能中途停住。", flush=True)
     basic_server.main()
     return 0
 

@@ -88,6 +88,11 @@ Each of these failed silently or blamed the wrong thing. All are current.
   swallowed exceptions and serves them on `/meeting-subtitles/backend`; the
   meeting unloads the refiner when they are out-of-memory, and the engine
   recovers by itself (after one stale `invalid device ordinal`).
+- **The server's VAD goes deaf on faint audio, and nothing fails.** Silero is
+  recurrent and the server never resets it; on distant room sound its state
+  drifted until every frame scored 0.00, so speech Whisper transcribes cleanly
+  never reached it and the subtitles froze. `serve.keep_vad_listening` clears
+  the state after 2 s without speech.
 - **Capturing `<default sink>.monitor` follows the default, it is not pinned.**
   WirePlumber treats a target equal to the default as "follow the default", so
   Zoom's "share computer sound" switch to its `zoomcombine` sink took the

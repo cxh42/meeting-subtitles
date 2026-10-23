@@ -170,6 +170,10 @@ class MeetingRunner:
         self.watchdog = StallWatchdog()
         self.system_watch = SystemAudioWatch()
         self._route_clear: asyncio.TimerHandle | None = None
+        #: Whether the engine answers the failure report, and what it said.
+        #: A stall with a reporting, healthy engine is not a crash.
+        self._engine_reports = False
+        self._engine_failing = False
 
     def request_stop(self) -> None:
         """Safe to call from any thread (the Tk thread does).
@@ -222,11 +226,22 @@ class MeetingRunner:
         to report its failures; :meth:`_on_engine_failing` is usually first.
         It does not unload the refiner: speech-level audio that yields no text
         can also be music, and the polish should not go for that.
+
+        When the engine reports and reports nothing wrong, the recogniser is
+        fine and its voice detector is calling the audio silence. That is
+        what faint room sound does -- a meeting played on another device and
+        caught by the webcam across the room -- and blaming the GPU there sent
+        the user after the wrong fault.
         """
-        message = ("识别停止了：还在收音，但 "
-                   f"{int(self.watchdog.stall_seconds)} 秒的语音没有产出文字。\n"
-                   "多半是显存被占满了：用 nvidia-smi 看是谁占着并关掉它，识别会自己恢复；"
-                   "仍不恢复就结束会议，在启动器里重启引擎。")
+        if self._engine_reports and not self._engine_failing:
+            message = ("字幕停了：还在收到声音，但识别引擎认为没有人在说话。\n"
+                       "多半是声音太小或太远——比如会议在另一台设备上外放，只被麦克风隔空收到。"
+                       "让这台电脑播放会议声音（耳机或音箱都行），或靠近麦克风说话。")
+        else:
+            message = ("识别停止了：还在收音，但 "
+                       f"{int(self.watchdog.stall_seconds)} 秒的语音没有产出文字。\n"
+                       "多半是显存被占满了：用 nvidia-smi 看是谁占着并关掉它，识别会自己恢复；"
+                       "仍不恢复就结束会议，在启动器里重启引擎。")
         logger.error("%s", message.replace("\n", " "))
         if self.overlay:
             self.overlay.set_notice(message, key="stall")
@@ -276,8 +291,10 @@ class MeetingRunner:
                     edge = watch.update(int(status.get("failures", 0)),
                                         int(status.get("out_of_memory", 0)),
                                         str(status.get("last_error", "")))
+                    self._engine_reports = True
                 except (TypeError, ValueError):
                     edge = None
+                self._engine_failing = watch.failing
                 if edge == "failing":
                     self._on_engine_failing(watch)
                 elif edge == "recovered":
